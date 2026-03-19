@@ -428,3 +428,32 @@ def get_user_prize_by_id(user_id: int, user_prize_id: int):
                 (user_id, user_prize_id),
             )
             return cur.fetchone()
+
+
+def get_game_winners(game_id: int):
+    """Победители игры из user_prizes: [(place_number, user_id, name, prize_name, coupon_text), ...]."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT up.place_number, up.user_id, up.prize_name, up.coupon_text, u.name, u.user_name
+                   FROM user_prizes up
+                   LEFT JOIN users u ON u.user_id = up.user_id
+                   WHERE up.game_id = %s
+                   ORDER BY up.place_number ASC, up.id ASC""",
+                (game_id,),
+            )
+            rows = cur.fetchall()
+    result = []
+    for row in rows:
+        uid = row["user_id"]
+        name = (row.get("name") or "").strip() or (row.get("user_name") or "").strip() or str(uid)
+        result.append(
+            (
+                int(row["place_number"]),
+                uid,
+                name,
+                (row.get("prize_name") or "").strip(),
+                (row.get("coupon_text") or "").strip(),
+            )
+        )
+    return result

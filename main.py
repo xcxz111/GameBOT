@@ -322,6 +322,20 @@ def admin_game_detail_keyboard(game_id: int, lang) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def admin_finished_game_detail_keyboard(game_id: int, lang) -> InlineKeyboardMarkup:
+    """Клавиатура прошедшей игры: список игроков, призов, победителей + назад/главная."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text=t("admin_btn_players", lang), callback_data=f"admin:game:{game_id}:players"))
+    builder.add(InlineKeyboardButton(text=t("admin_btn_prizes_list", lang), callback_data=f"admin:game:{game_id}:prizes"))
+    builder.add(InlineKeyboardButton(text=t("admin_btn_winners_list", lang), callback_data=f"admin:game:{game_id}:winners"))
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:games:past"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+    )
+    builder.adjust(1, 1, 1, 2)
+    return builder.as_markup()
+
+
 def admin_game_confirm_cancel_keyboard(game_id: int, lang) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text=t("admin_btn_yes", lang), callback_data=f"admin:game:{game_id}:confirm_cancel"))
@@ -792,7 +806,8 @@ async def on_admin(cb: CallbackQuery):
                 prizes = get_prizes(game_id)
                 city_label = t("admin_game_city_all", lang) if not game.get("city_id") else (get_city(game["city_id"]) or {}).get("city") or str(game["city_id"])
                 text = _format_game_detail(game, prizes, city_label, lang)
-                await cb.message.edit_text(text, reply_markup=admin_game_detail_keyboard(game_id, lang))
+                kb = admin_finished_game_detail_keyboard(game_id, lang) if game.get("status") == "finish" else admin_game_detail_keyboard(game_id, lang)
+                await cb.message.edit_text(text, reply_markup=kb)
                 await cb.answer()
                 return
             if len(parts) == 4 and parts[3] == "players":
@@ -805,6 +820,50 @@ async def on_admin(cb: CallbackQuery):
                 for i, (uid, name) in enumerate(participants, 1):
                     safe = html.escape(name)
                     lines.append(f'{i}. <a href="tg://user?id={uid}">{safe}</a>')
+                from db.queries import get_game
+                game = get_game(game_id)
+                back_target = f"admin:game:{game_id}"
+                kb = InlineKeyboardBuilder()
+                kb.add(
+                    InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data=back_target),
+                    InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+                )
+                kb.adjust(2)
+                await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+                await cb.answer()
+                return
+            if len(parts) == 4 and parts[3] == "prizes":
+                from db.queries import get_prizes
+                prizes = get_prizes(game_id)
+                lines = [t("admin_prizes_title", lang), ""]
+                for p in prizes:
+                    name = (p.get("prize_name") or "").strip()
+                    val = (p.get("coupon_text") or "").strip()
+                    if name and val:
+                        lines.append(f"{p['place_number']}. {html.escape(name)}: {html.escape(val)}")
+                    elif name:
+                        lines.append(f"{p['place_number']}. {html.escape(name)}")
+                    else:
+                        lines.append(f"{p['place_number']}. {html.escape(val)}")
+                kb = InlineKeyboardBuilder()
+                kb.add(
+                    InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data=f"admin:game:{game_id}"),
+                    InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+                )
+                kb.adjust(2)
+                await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+                await cb.answer()
+                return
+            if len(parts) == 4 and parts[3] == "winners":
+                from db.queries import get_game_winners
+                winners = get_game_winners(game_id)
+                lines = [t("admin_winners_title", lang), ""]
+                for place, uid, name, prize_name, _coupon_text in winners:
+                    safe_name = html.escape(name)
+                    if prize_name:
+                        lines.append(f"{place}. <a href=\"tg://user?id={uid}\">{safe_name}</a> — {html.escape(prize_name)}")
+                    else:
+                        lines.append(f"{place}. <a href=\"tg://user?id={uid}\">{safe_name}</a>")
                 kb = InlineKeyboardBuilder()
                 kb.add(
                     InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data=f"admin:game:{game_id}"),
