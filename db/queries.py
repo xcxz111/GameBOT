@@ -2,6 +2,7 @@
 from typing import Optional
 from datetime import datetime
 from db.init_db import get_connection
+from db.external_db import get_external_connection
 
 
 def get_cities():
@@ -60,6 +61,51 @@ def get_user(user_id: int):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
             return cur.fetchone()
+
+
+def is_admin_user(user_id: int) -> bool:
+    """Проверка, есть ли пользователь в таблице admins."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM admins WHERE user_id = %s LIMIT 1", (user_id,))
+            return cur.fetchone() is not None
+
+
+def add_admin_user(user_id: int) -> bool:
+    """Добавить пользователя в таблицу admins."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT IGNORE INTO admins (user_id) VALUES (%s)", (user_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def get_active_chat_id() -> Optional[int]:
+    """Получить активный chat_id из app_settings."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `value` FROM app_settings WHERE `key` = 'active_chat_id' LIMIT 1")
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                return int(row.get("value"))
+            except Exception:
+                return None
+
+
+def set_active_chat_id(chat_id: int) -> bool:
+    """Сохранить активный chat_id в app_settings."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO app_settings (`key`, `value`)
+                   VALUES ('active_chat_id', %s)
+                   ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)""",
+                (str(int(chat_id)),),
+            )
+            conn.commit()
+            return True
 
 
 def save_user(user_id: int, user_name: Optional[str], name: Optional[str], city_id: Optional[int] = None, language_code: Optional[str] = None):
@@ -457,3 +503,338 @@ def get_game_winners(game_id: int):
             )
         )
     return result
+
+
+def get_external_user_balance(user_id: int, username: Optional[str] = None):
+    """Баланс пользователя из внешней БД (таблица users.balance). Только чтение."""
+    try:
+        with get_external_connection() as conn:
+            with conn.cursor() as cur:
+                # Строго по ТЗ: users.id -> users.balance
+                cur.execute("SELECT balance FROM users WHERE id = %s LIMIT 1", (user_id,))
+                row = cur.fetchone()
+                if row is not None and "balance" in row:
+                    return row.get("balance")
+    except Exception:
+        return None
+    return None
+
+
+def update_external_user_balance(user_id: int, delta: float) -> bool:
+    """Изменить баланс пользователя во внешней БД (users.balance = balance + delta)."""
+    try:
+        with get_external_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET balance = balance + %s WHERE id = %s",
+                    (delta, user_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def is_21_vs_bot_enabled() -> bool:
+    """Статус режима 21 против бота."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT enabled FROM game21_bot_settings WHERE id = 1")
+            row = cur.fetchone()
+            if not row:
+                cur.execute("INSERT INTO game21_bot_settings (id, enabled, commission_percent) VALUES (1, 0, 0.00)")
+                conn.commit()
+                return False
+            return bool(row.get("enabled"))
+
+
+def is_21_vs_users_enabled() -> bool:
+    """Статус режима 21 против пользователей (в чате)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT enabled_users FROM game21_bot_settings WHERE id = 1")
+            row = cur.fetchone()
+            if not row:
+                # В старых версиях без колонки, но у миграции есть дефолт.
+                cur.execute(
+                    "INSERT INTO game21_bot_settings (id, enabled, enabled_users, commission_percent, commission_users_percent) VALUES (1, 0, 1, 0.00, 0.00)"
+                )
+                conn.commit()
+                return True
+            return bool(row.get("enabled_users"))
+
+
+def set_21_users_enabled(enabled: bool) -> bool:
+    """Включить/выключить режим 21 против пользователей."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_bot_settings
+                   (id, enabled, enabled_users, commission_percent, commission_users_percent)
+                   VALUES (1, 0, %s, 0.00, 0.00)
+                   ON DUPLICATE KEY UPDATE enabled_users = VALUES(enabled_users)""",
+                (1 if enabled else 0,),
+            )
+            conn.commit()
+            return True
+
+
+def set_21_vs_bot_enabled(enabled: bool) -> bool:
+    """Включить/выключить режим 21 против бота."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_bot_settings (id, enabled, commission_percent)
+                   VALUES (1, %s, 0.00)
+                   ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)""",
+                (1 if enabled else 0,),
+            )
+            conn.commit()
+            return True
+
+
+def get_21_bot_commission_percent() -> float:
+    """Комиссия 21 против бота в процентах."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT commission_percent FROM game21_bot_settings WHERE id = 1")
+            row = cur.fetchone()
+            if not row:
+                cur.execute("INSERT INTO game21_bot_settings (id, enabled, commission_percent) VALUES (1, 0, 0.00)")
+                conn.commit()
+                return 0.0
+            try:
+                return float(row.get("commission_percent") or 0.0)
+            except Exception:
+                return 0.0
+
+
+def set_21_bot_commission_percent(percent: float) -> bool:
+    """Установить комиссию 21 против бота в процентах (0..100)."""
+    p = float(percent)
+    if p < 0:
+        p = 0.0
+    if p > 100:
+        p = 100.0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_bot_settings (id, enabled, commission_percent)
+                   VALUES (1, 0, %s)
+                   ON DUPLICATE KEY UPDATE commission_percent = VALUES(commission_percent)""",
+                (p,),
+            )
+            conn.commit()
+            return True
+
+
+def get_21_users_commission_percent() -> float:
+    """Комиссия 21 между пользователями в процентах."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT commission_users_percent FROM game21_bot_settings WHERE id = 1")
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    "INSERT INTO game21_bot_settings (id, enabled, commission_percent, commission_users_percent) VALUES (1, 0, 0.00, 0.00)"
+                )
+                conn.commit()
+                return 0.0
+            try:
+                return float(row.get("commission_users_percent") or 0.0)
+            except Exception:
+                return 0.0
+
+
+def set_21_users_commission_percent(percent: float) -> bool:
+    """Установить комиссию 21 между пользователями в процентах (0..100)."""
+    p = float(percent)
+    if p < 0:
+        p = 0.0
+    if p > 100:
+        p = 100.0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_bot_settings (id, enabled, commission_percent, commission_users_percent)
+                   VALUES (1, 0, 0.00, %s)
+                   ON DUPLICATE KEY UPDATE commission_users_percent = VALUES(commission_users_percent)""",
+                (p,),
+            )
+            conn.commit()
+            return True
+
+
+def create_21_bot_session(user_id: int, bet_amount: float, commission_percent: float) -> Optional[int]:
+    """Создать сессию 21 против бота."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_bot_sessions
+                   (user_id, status, bet_amount, commission_percent, total_rounds, total_wins, total_losses, total_draws)
+                   VALUES (%s, 'active', %s, %s, 0, 0, 0, 0)""",
+                (user_id, float(bet_amount), float(commission_percent)),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def close_21_bot_session(session_id: int, result: str, winner: str, net_result: float) -> bool:
+    """Закрыть сессию 21 против бота итоговым результатом."""
+    wins = 1 if result == "win" else 0
+    losses = 1 if result == "lose" else 0
+    draws = 1 if result == "draw" else 0
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE game21_bot_sessions
+                   SET status = 'finish',
+                       result = %s,
+                       winner = %s,
+                       net_result = %s,
+                       total_rounds = 1,
+                       total_wins = %s,
+                       total_losses = %s,
+                       total_draws = %s
+                   WHERE id = %s""",
+                (result, winner, float(net_result), wins, losses, draws, session_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def add_21_bot_round(
+    session_id: int,
+    round_number: int,
+    player_cards: str,
+    bot_cards: str,
+    player_points: int,
+    bot_points: int,
+    result: str,
+    winner: str,
+    bet_amount: float,
+    commission_percent: float,
+    net_result: float,
+) -> bool:
+    """Записать раунд 21 против бота."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_bot_rounds
+                   (session_id, round_number, player_cards, bot_cards, player_points, bot_points, result, winner, bet_amount, commission_percent, net_result)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    session_id,
+                    int(round_number),
+                    player_cards,
+                    bot_cards,
+                    int(player_points),
+                    int(bot_points),
+                    result,
+                    winner,
+                    float(bet_amount),
+                    float(commission_percent),
+                    float(net_result),
+                ),
+            )
+            conn.commit()
+            return True
+
+
+def get_21_bot_stats():
+    """Статистика режима 21 против бота по завершённым сессиям."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT
+                       COUNT(*) AS total_games,
+                       COALESCE(SUM(CASE WHEN result = 'lose' THEN 1 ELSE 0 END), 0) AS bot_wins_count,
+                       COALESCE(SUM(CASE WHEN result = 'lose' THEN -net_result ELSE 0 END), 0) AS bot_wins_sum,
+                       COALESCE(SUM(CASE WHEN result = 'win' THEN 1 ELSE 0 END), 0) AS bot_losses_count,
+                       COALESCE(SUM(CASE WHEN result = 'win' THEN net_result ELSE 0 END), 0) AS bot_losses_sum,
+                       COALESCE(SUM(CASE WHEN result = 'draw' THEN 1 ELSE 0 END), 0) AS draws_count,
+                       COALESCE(SUM(-net_result), 0) AS bot_profit
+                   FROM game21_bot_sessions
+                   WHERE status = 'finish'"""
+            )
+            row = cur.fetchone() or {}
+            return {
+                "total_games": int(row.get("total_games") or 0),
+                "bot_wins_count": int(row.get("bot_wins_count") or 0),
+                "bot_wins_sum": float(row.get("bot_wins_sum") or 0.0),
+                "bot_losses_count": int(row.get("bot_losses_count") or 0),
+                "bot_losses_sum": float(row.get("bot_losses_sum") or 0.0),
+                "draws_count": int(row.get("draws_count") or 0),
+                "bot_profit": float(row.get("bot_profit") or 0.0),
+            }
+
+
+def add_21_users_game(
+    player1_id: int,
+    player2_id: int,
+    bet_amount: float,
+    commission_percent: float,
+    result: str,
+    winner_id: Optional[int],
+    commission_amount: float,
+) -> Optional[int]:
+    """Записать игру 21 между пользователями (для админской статистики)."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO game21_users_sessions
+                   (player1_id, player2_id, bet_amount, commission_percent, commission_amount, result, winner_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    int(player1_id),
+                    int(player2_id),
+                    float(bet_amount),
+                    float(commission_percent),
+                    float(commission_amount),
+                    str(result or "draw"),
+                    int(winner_id) if winner_id is not None else None,
+                ),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def add_21_users_round_events(session_id: int, events: list) -> bool:
+    """Сохранить события бросков 21 между пользователями."""
+    if not events:
+        return True
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for e in events:
+                cur.execute(
+                    """INSERT INTO game21_users_rounds
+                       (session_id, phase, user_id, throw_order, value, total_after)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        int(session_id),
+                        str(e.get("phase") or "turn"),
+                        int(e.get("user_id")),
+                        int(e.get("throw_order") or 0),
+                        int(e.get("value") or 0),
+                        int(e.get("total_after")) if e.get("total_after") is not None else None,
+                    ),
+                )
+            conn.commit()
+            return True
+
+
+def get_21_users_stats():
+    """Статистика режима 21 между пользователями."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT
+                       COUNT(*) AS total_games,
+                       COALESCE(SUM(commission_amount), 0) AS bot_commission_sum
+                   FROM game21_users_sessions"""
+            )
+            row = cur.fetchone() or {}
+            return {
+                "total_games": int(row.get("total_games") or 0),
+                "bot_commission_sum": float(row.get("bot_commission_sum") or 0.0),
+            }

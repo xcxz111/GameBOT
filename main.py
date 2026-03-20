@@ -33,6 +33,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+# Меньше шума от aiogram по "handled/not handled" на каждом апдейте
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 
 class ChatFilter:
@@ -55,9 +57,10 @@ class ChatFilter:
         # личка с ботом — пропускаем (там /start и выбор города)
         if chat_type == "private":
             return await handler(event, data)
-        # в остальных чатах — только наш CHAT_ID
-        if chat_id != self.chat_id:
-            logger.debug("ChatFilter: пропуск чата id=%s (ожидается %s)", chat_id, self.chat_id)
+        # в остальных чатах — только активный чат из настроек
+        expected_chat_id = CHAT_ID
+        if chat_id != expected_chat_id:
+            logger.debug("ChatFilter: пропуск чата id=%s (ожидается %s)", chat_id, expected_chat_id)
             return
         return await handler(event, data)
 
@@ -118,11 +121,22 @@ def city_keyboard(language_code) -> InlineKeyboardMarkup:
 
 def main_menu_keyboard(language_code, user_id: int = None) -> InlineKeyboardMarkup:
     """Кнопки главного меню: личный кабинет, записаться на игру, [админка только для админа], язык."""
+    from db.queries import is_21_vs_bot_enabled, is_21_vs_users_enabled, is_admin_user
     builder = InlineKeyboardBuilder()
     builder.add(InlineKeyboardButton(text=t("btn_cabinet", language_code), callback_data="menu:cabinet"))
     builder.add(InlineKeyboardButton(text=t("btn_signup", language_code), callback_data="menu:signup"))
-    if user_id and user_id == ADMIN_ID:
-        builder.add(InlineKeyboardButton(text=t("btn_admin", language_code), callback_data="menu:admin"))
+    try:
+        if is_21_vs_bot_enabled() or is_21_vs_users_enabled():
+            builder.add(InlineKeyboardButton(text=t("btn_play_21_bot", language_code), callback_data="menu:play21bot"))
+    except Exception:
+        pass
+    if user_id:
+        try:
+            can_admin = (user_id == ADMIN_ID or is_admin_user(user_id))
+        except Exception:
+            can_admin = (user_id == ADMIN_ID)
+        if can_admin:
+            builder.add(InlineKeyboardButton(text=t("btn_admin", language_code), callback_data="menu:admin"))
     builder.add(InlineKeyboardButton(text=t("btn_lang", language_code), callback_data="menu:lang"))
     builder.adjust(1)  # по одной в ряд
     return builder.as_markup()
@@ -200,10 +214,134 @@ def cabinet_prizes_keyboard(lang, prizes: list) -> InlineKeyboardMarkup:
 
 # Состояние админа: user_id -> {"state": str, "city_id": int | None}
 _admin_state = {}
+# Состояние пользователя (личные сценарии): user_id -> {"state": str, ...}
+_user_state = {}
+# Заявки на матч 21 vs user: owner_user_id -> meta
+_pvp_search_state = {}
+# Активные матчи 21 между пользователями: chat_id -> state
+_pvp_live_games = {}
 
 
 def _admin_clear(user_id: int):
     _admin_state.pop(user_id, None)
+
+
+def _user_clear(user_id: int):
+    _user_state.pop(user_id, None)
+
+
+async def _send_fresh_callback(
+    cb: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup = None,
+):
+    """Удалить старое callback-сообщение и отправить новое."""
+    chat_id = cb.message.chat.id if cb.message and cb.message.chat else cb.from_user.id
+    try:
+        if cb.message:
+            await cb.message.delete()
+    except Exception:
+        pass
+    await cb.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
+def play21_rules_keyboard(lang) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="menu:play21bot"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="menu:main"),
+    )
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def play21_confirm_keyboard(lang) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text=t("game21_btn_yes", lang), callback_data="menu:play21bot:confirm:yes"),
+        InlineKeyboardButton(text=t("game21_btn_no", lang), callback_data="menu:play21bot:confirm:no"),
+    )
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="menu:play21bot"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="menu:main"),
+    )
+    builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+def play21_pvp_confirm_keyboard(lang) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text=t("game21_btn_yes", lang), callback_data="menu:play21bot:pvp:confirm:yes"),
+        InlineKeyboardButton(text=t("game21_btn_no", lang), callback_data="menu:play21bot:pvp:confirm:no"),
+    )
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="menu:play21bot"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="menu:main"),
+    )
+    builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+def play21_pvp_accept_keyboard(lang, owner_user_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(
+            text=t("game21_pvp_btn_accept", lang),
+            callback_data=f"menu:play21bot:pvp:accept:{owner_user_id}",
+        )
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def play21_pvp_stop_keyboard(lang, owner_user_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(
+            text=t("game21_btn_stop", lang),
+            callback_data=f"menu:play21bot:pvp:stop:{owner_user_id}",
+        )
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def play21_menu_keyboard(lang) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    from db.queries import is_21_vs_bot_enabled, is_21_vs_users_enabled
+    try:
+        bot_enabled = is_21_vs_bot_enabled()
+    except Exception:
+        bot_enabled = False
+    try:
+        users_enabled = is_21_vs_users_enabled()
+    except Exception:
+        users_enabled = False
+
+    top_count = 0
+    builder.add(InlineKeyboardButton(text=t("game21_btn_rules", lang), callback_data="menu:play21bot:rules"))
+    top_count += 1
+    if bot_enabled:
+        builder.add(InlineKeyboardButton(text=t("game21_btn_vs_bot", lang), callback_data="menu:play21bot:bot"))
+        top_count += 1
+    if users_enabled:
+        builder.add(InlineKeyboardButton(text=t("game21_btn_vs_user_chat", lang), callback_data="menu:play21bot:pvp"))
+        top_count += 1
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="menu:main"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="menu:main"),
+    )
+    # Каждая верхняя кнопка в отдельной строке, а "назад+главная" — в одной строке
+    builder.adjust(*([1] * top_count + [2]))
+    return builder.as_markup()
+
+
+def play21_stop_keyboard(lang) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text=t("game21_btn_stop", lang), callback_data="menu:play21bot:stop"))
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def admin_main_keyboard(lang) -> InlineKeyboardMarkup:
@@ -213,8 +351,63 @@ def admin_main_keyboard(lang) -> InlineKeyboardMarkup:
     builder.add(InlineKeyboardButton(text=t("admin_btn_create_game", lang), callback_data="admin:create_game"))
     builder.add(InlineKeyboardButton(text=t("admin_btn_games", lang), callback_data="admin:games"))
     builder.add(InlineKeyboardButton(text=t("admin_btn_settings_21", lang), callback_data="admin:settings21"))
+    builder.add(InlineKeyboardButton(text=t("admin_btn_add_admin", lang), callback_data="admin:add_admin"))
+    builder.add(InlineKeyboardButton(text=t("admin_btn_add_chat", lang), callback_data="admin:add_chat"))
     builder.add(InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:main"))
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_settings_21_keyboard(lang) -> InlineKeyboardMarkup:
+    """Главное меню раздела Настройки 21."""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_vs_bot_menu", lang), callback_data="admin:settings21:botmenu"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_vs_players_menu", lang), callback_data="admin:settings21:usersmenu"))
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:back"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+    )
+    builder.adjust(1, 1, 2)
+    return builder.as_markup()
+
+
+def admin_settings_21_bot_keyboard(lang) -> InlineKeyboardMarkup:
+    """Подменю 'против бота' в Настройках 21."""
+    from db.queries import is_21_vs_bot_enabled
+    try:
+        enabled = is_21_vs_bot_enabled()
+    except Exception:
+        enabled = False
+    builder = InlineKeyboardBuilder()
+    toggle_text = t("admin_21_btn_vs_bot_on", lang) if enabled else t("admin_21_btn_vs_bot_off", lang)
+    builder.add(InlineKeyboardButton(text=toggle_text, callback_data="admin:settings21:vsbot"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_fee", lang), callback_data="admin:settings21:fee"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_stats", lang), callback_data="admin:settings21:stats"))
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:settings21"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+    )
+    builder.adjust(1, 1, 1, 2)
+    return builder.as_markup()
+
+
+def admin_settings_21_users_keyboard(lang) -> InlineKeyboardMarkup:
+    """Подменю 'между пользователями' в Настройках 21."""
+    builder = InlineKeyboardBuilder()
+    from db.queries import is_21_vs_users_enabled
+    try:
+        enabled = is_21_vs_users_enabled()
+    except Exception:
+        enabled = False
+    toggle_text = t("admin_21_btn_vs_users_on", lang) if enabled else t("admin_21_btn_vs_users_off", lang)
+    builder.add(InlineKeyboardButton(text=toggle_text, callback_data="admin:settings21:vsplayers"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_fee", lang), callback_data="admin:settings21:users:fee"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_stats", lang), callback_data="admin:settings21:users:stats"))
+    builder.add(
+        InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:settings21"),
+        InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+    )
+    builder.adjust(1, 1, 1, 2)
     return builder.as_markup()
 
 
@@ -486,6 +679,536 @@ def _user_lang(msg_or_cb):
     return None
 
 
+def _format_user_balance(value, lang) -> str:
+    if value is None:
+        return t("welcome_balance_unknown", lang)
+    try:
+        num = float(value)
+        if num.is_integer():
+            return str(int(num))
+        return f"{num:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def _welcome_text_with_profile(lang, user_id: int) -> str:
+    from db.queries import get_external_user_balance, get_user
+    user = get_user(user_id) or {}
+    username = user.get("user_name")
+    balance = get_external_user_balance(user_id, username=username)
+    balance_str = _format_user_balance(balance, lang)
+    return (
+        f"{t('welcome_menu', lang)}\n\n"
+        f"{t('welcome_user_id', lang).format(user_id=user_id)}\n"
+        f"{t('welcome_balance', lang).format(balance=balance_str)}"
+    )
+
+
+def _parse_amount(raw: str):
+    s = (raw or "").strip().replace(",", ".")
+    try:
+        val = float(s)
+    except Exception:
+        return None
+    if val <= 0:
+        return None
+    return round(val, 2)
+
+
+def _format_money(v: float) -> str:
+    try:
+        f = float(v)
+    except Exception:
+        return str(v)
+    if f.is_integer():
+        return str(int(f))
+    return f"{f:.2f}".rstrip("0").rstrip(".")
+
+
+def _name_link(user_id: int, name: str) -> str:
+    return f'<a href="tg://user?id={user_id}">{html.escape((name or "").strip() or str(user_id))}</a>'
+
+
+async def _pvp_prompt_turn(bot: Bot, chat_id: int, st: dict):
+    lang = st.get("lang") or DEFAULT_LANG
+    uid = int(st.get("current_turn_uid") or 0)
+    name = (st.get("names") or {}).get(uid, str(uid))
+    await bot.send_message(chat_id=chat_id, text=t("game21_pvp_turn_prompt", lang).format(name=_name_link(uid, name)))
+    st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+    _pvp_live_games[chat_id] = st
+    asyncio.create_task(_pvp_turn_timeout(bot, chat_id, uid, st["turn_timeout_token"]))
+
+
+async def _pvp_turn_timeout(bot: Bot, chat_id: int, uid: int, token: int):
+    await asyncio.sleep(300)
+    st = _pvp_live_games.get(chat_id) or {}
+    if st.get("phase") != "turn":
+        return
+    if int(st.get("current_turn_uid") or 0) != int(uid):
+        return
+    if int(st.get("turn_timeout_token") or 0) != int(token):
+        return
+    loser_id = int(uid)
+    p1 = int(st.get("player1_id") or 0)
+    p2 = int(st.get("player2_id") or 0)
+    winner_id = p2 if loser_id == p1 else p1
+    await _finish_21_pvp_game(bot, chat_id, st, winner_id=winner_id)
+
+
+async def _pvp_search_timeout(bot: Bot, owner_user_id: int, token: int):
+    """Если за 5 минут никто не нажал «Принять», отменяем заявку и возвращаем ставку."""
+    await asyncio.sleep(300)
+    req = _pvp_search_state.get(owner_user_id) or {}
+    if not req:
+        return
+    if req.get("accepted_by"):
+        return
+    if int(req.get("search_timeout_token") or 0) != int(token):
+        return
+    amount = float(req.get("bet_amount") or 0.0)
+    from db.queries import update_external_user_balance
+    update_external_user_balance(owner_user_id, amount)
+    # Снимаем закреп, если он был
+    try:
+        message_id = req.get("message_id")
+        if message_id is not None:
+            await bot.unpin_chat_message(chat_id=int(req.get("chat_id") or CHAT_ID), message_id=int(message_id))
+    except Exception:
+        pass
+    lang = req.get("lang") or DEFAULT_LANG
+    try:
+        await bot.send_message(
+            chat_id=owner_user_id,
+            text=t("game21_pvp_search_not_accepted", lang).format(amount=_format_money(amount)),
+        )
+    except Exception:
+        pass
+    _pvp_search_state.pop(owner_user_id, None)
+
+
+async def _finish_21_pvp_game(bot: Bot, chat_id: int, st: dict, winner_id: int = None, draw: bool = False):
+    from db.queries import update_external_user_balance
+    lang = st.get("lang") or DEFAULT_LANG
+    p1 = int(st.get("player1_id") or 0)
+    p2 = int(st.get("player2_id") or 0)
+    bet = float(st.get("bet_amount") or 0.0)
+    commission = float(st.get("commission_percent") or 0.0)
+    gross = bet * 2
+    payout = round(gross * (1 - commission / 100.0), 2)
+    commission_amount = round(gross - payout, 2) if not draw else 0.0
+    if draw:
+        update_external_user_balance(p1, bet)
+        update_external_user_balance(p2, bet)
+        await bot.send_message(chat_id=chat_id, text=t("game21_pvp_draw", lang))
+        # Личные сообщения обоим игрокам
+        try:
+            await bot.send_message(
+                chat_id=p1,
+                text=t("game21_pvp_pm_draw", lang).format(amount=_format_money(bet)),
+            )
+        except Exception:
+            pass
+        try:
+            await bot.send_message(
+                chat_id=p2,
+                text=t("game21_pvp_pm_draw", lang).format(amount=_format_money(bet)),
+            )
+        except Exception:
+            pass
+    else:
+        if winner_id in (p1, p2):
+            update_external_user_balance(winner_id, payout)
+            w_name = (st.get("names") or {}).get(winner_id, str(winner_id))
+            await bot.send_message(
+                chat_id=chat_id,
+                text=t("game21_pvp_winner", lang).format(name=_name_link(winner_id, w_name)),
+            )
+            # Личное сообщение победителю
+            try:
+                await bot.send_message(
+                    chat_id=winner_id,
+                    text=t("game21_pvp_pm_win", lang).format(amount=_format_money(payout)),
+                )
+            except Exception:
+                pass
+    # Записываем игру в основную БД для админской статистики
+    try:
+        from db.queries import add_21_users_game, add_21_users_round_events
+        result_code = "draw" if draw else "win"
+        win_id = None if draw else winner_id
+        session_id = add_21_users_game(
+            player1_id=p1,
+            player2_id=p2,
+            bet_amount=bet,
+            commission_percent=commission,
+            result=result_code,
+            winner_id=win_id,
+            commission_amount=commission_amount,
+        )
+        if session_id:
+            add_21_users_round_events(session_id, list(st.get("round_events") or []))
+    except Exception:
+        pass
+    # Убираем закреп с объявления поиска
+    pinned_id = st.get("pinned_message_id")
+    if pinned_id is not None:
+        try:
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=int(pinned_id))
+        except Exception:
+            pass
+    _pvp_live_games.pop(chat_id, None)
+
+
+async def _pvp_after_turn_end(bot: Bot, chat_id: int, st: dict, finished_uid: int):
+    p1 = int(st.get("player1_id") or 0)
+    p2 = int(st.get("player2_id") or 0)
+    other_uid = p2 if int(finished_uid) == p1 else p1
+    turns_done = dict(st.get("turns_done") or {})
+    if not turns_done:
+        # На всякий случай для уже созданных матчей
+        turns_done = {p1: True if int(finished_uid) == p1 else False, p2: True if int(finished_uid) == p2 else False}
+    if not turns_done.get(other_uid):
+        st["current_turn_uid"] = other_uid
+        _pvp_live_games[chat_id] = st
+        await _pvp_prompt_turn(bot, chat_id, st)
+        return
+    t1 = int((st.get("totals") or {}).get(p1, 0))
+    t2 = int((st.get("totals") or {}).get(p2, 0))
+    if t1 > 21 and t2 > 21:
+        await _finish_21_pvp_game(bot, chat_id, st, draw=True)
+        return
+    if t1 > 21:
+        await _finish_21_pvp_game(bot, chat_id, st, winner_id=p2)
+        return
+    if t2 > 21:
+        await _finish_21_pvp_game(bot, chat_id, st, winner_id=p1)
+        return
+    if t1 == t2:
+        await _finish_21_pvp_game(bot, chat_id, st, draw=True)
+        return
+    winner = p1 if t1 > t2 else p2
+    await _finish_21_pvp_game(bot, chat_id, st, winner_id=winner)
+
+
+async def _handle_pvp_dice(msg: Message) -> bool:
+    if not msg or not msg.chat or not msg.from_user:
+        return False
+    # Пересланные сообщения не учитываем как результат броска
+    if getattr(msg, "forward_date", None) is not None or getattr(msg, "forward_origin", None) is not None:
+        return False
+    chat_id = msg.chat.id
+    st = _pvp_live_games.get(chat_id)
+    if not st:
+        return False
+    if not msg.dice or getattr(msg.dice, "emoji", None) != "🎲":
+        return True
+    lang = st.get("lang") or DEFAULT_LANG
+    uid = msg.from_user.id
+    p1 = int(st.get("player1_id") or 0)
+    p2 = int(st.get("player2_id") or 0)
+    if uid not in (p1, p2):
+        return True
+    names = st.get("names") or {}
+    val = int(getattr(msg.dice, "value", 0) or 0)
+    if st.get("phase") == "decide_first":
+        st["throw_order_seq"] = int(st.get("throw_order_seq") or 0) + 1
+        events = list(st.get("round_events") or [])
+        events.append(
+            {
+                "phase": "decide_first",
+                "user_id": uid,
+                "throw_order": st["throw_order_seq"],
+                "value": val,
+                "total_after": None,
+            }
+        )
+        st["round_events"] = events
+        if uid in (st.get("decide_rolls") or {}):
+            return True
+        decide_rolls = dict(st.get("decide_rolls") or {})
+        decide_rolls[uid] = val
+        st["decide_rolls"] = decide_rolls
+        _pvp_live_games[chat_id] = st
+        await msg.bot.send_message(
+            chat_id=chat_id,
+            text=t("game21_pvp_decide_roll_result", lang).format(name=_name_link(uid, names.get(uid, str(uid))), value=val),
+        )
+        if p1 in decide_rolls and p2 in decide_rolls:
+            v1, v2 = int(decide_rolls[p1]), int(decide_rolls[p2])
+            if v1 == v2:
+                st["decide_rolls"] = {}
+                _pvp_live_games[chat_id] = st
+                await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_decide_tie", lang))
+                return True
+            starter = p1 if v1 < v2 else p2
+            st["phase"] = "turn"
+            st["current_turn_uid"] = starter
+            st["totals"] = {p1: 0, p2: 0}
+            st["throws"] = {p1: [], p2: []}
+            st["turns_done"] = {p1: False, p2: False}
+            st["decide_rolls"] = {}
+            _pvp_live_games[chat_id] = st
+            await _pvp_prompt_turn(msg.bot, chat_id, st)
+        return True
+    if st.get("phase") != "turn":
+        return True
+    if uid != int(st.get("current_turn_uid") or 0):
+        return True
+    # Если до этого бот показал кнопку "Хватит" и пользователь не нажал ее,
+    # то при новом броске снимаем старую inline-клавиатуру.
+    try:
+        stop_mid = st.get("stop_button_message_id")
+        stop_uid = st.get("stop_button_uid")
+        if stop_mid is not None and stop_uid == uid:
+            await msg.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=int(stop_mid),
+                reply_markup=None,
+            )
+            st["stop_button_message_id"] = None
+            st["stop_button_uid"] = None
+            _pvp_live_games[chat_id] = st
+    except Exception:
+        pass
+    totals = dict(st.get("totals") or {})
+    throws = dict(st.get("throws") or {})
+    turns_done = dict(st.get("turns_done") or {})
+    totals[uid] = int(totals.get(uid) or 0) + val
+    u_throws = list(throws.get(uid) or [])
+    u_throws.append(val)
+    throws[uid] = u_throws
+    st["totals"] = totals
+    st["throws"] = throws
+    st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+    st["throw_order_seq"] = int(st.get("throw_order_seq") or 0) + 1
+    events = list(st.get("round_events") or [])
+    events.append(
+        {
+            "phase": "turn",
+            "user_id": uid,
+            "throw_order": st["throw_order_seq"],
+            "value": val,
+            "total_after": int(totals[uid]),
+        }
+    )
+    st["round_events"] = events
+    _pvp_live_games[chat_id] = st
+    total = int(totals[uid])
+    name_link = _name_link(uid, names.get(uid, str(uid)))
+    other_uid = p2 if uid == p1 else p1
+    other_total = int(totals.get(other_uid) or 0)
+    # "Второй игрок": первый уже закончил ход, текущий — еще нет.
+    is_second_player_turn = bool(turns_done.get(other_uid)) and not bool(turns_done.get(uid))
+    if total > 21:
+        await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_player_busted", lang).format(name=name_link, total=total))
+        loser_id = uid
+        winner_id = p2 if loser_id == p1 else p1
+        await _finish_21_pvp_game(msg.bot, chat_id, st, winner_id=winner_id)
+        return True
+    if total == 21:
+        # Правило PvP:
+        # - если 21 сделал первый игрок -> ход переходит второму
+        # - если 21 сделал второй игрок -> игра заканчивается (или ничья если у первого тоже 21)
+        await msg.bot.send_message(
+            chat_id=chat_id, text=t("game21_pvp_player_blackjack", lang).format(name=name_link)
+        )
+        st["turns_done"] = dict(st.get("turns_done") or {})
+        st["turns_done"][uid] = True
+        _pvp_live_games[chat_id] = st
+        if is_second_player_turn:
+            if other_total == 21:
+                await _finish_21_pvp_game(msg.bot, chat_id, st, draw=True)
+            else:
+                await _finish_21_pvp_game(msg.bot, chat_id, st, winner_id=uid)
+            return True
+        # total == 21 у первого -> передаём ход второму
+        await _pvp_after_turn_end(msg.bot, chat_id, st, uid)
+        return True
+    if total < 16:
+        await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_player_result", lang).format(name=name_link, total=total))
+        st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+        _pvp_live_games[chat_id] = st
+        asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+        return True
+    if is_second_player_turn:
+        # Второй игрок бросает автоматически, пока не станет:
+        # - больше результата первого (тогда победа второго),
+        # - или равным результату первого (тогда появляется кнопка "Хватит" для ничьей).
+        if total > other_total:
+            await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_player_result", lang).format(name=name_link, total=total))
+            st["turns_done"] = dict(st.get("turns_done") or {})
+            st["turns_done"][uid] = True
+            _pvp_live_games[chat_id] = st
+            await _pvp_after_turn_end(msg.bot, chat_id, st, uid)
+            return True
+        if total == other_total:
+            stop_msg = await msg.bot.send_message(
+                chat_id=chat_id,
+                text=t("game21_pvp_player_can_stop", lang).format(name=name_link, total=total),
+                reply_markup=play21_pvp_stop_keyboard(lang, int(st.get("owner_id") or 0)),
+            )
+            st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+            st["stop_button_message_id"] = stop_msg.message_id
+            st["stop_button_uid"] = uid
+            _pvp_live_games[chat_id] = st
+            asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+            return True
+
+        # total < other_total
+        await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_player_result", lang).format(name=name_link, total=total))
+        st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+        _pvp_live_games[chat_id] = st
+        asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+        return True
+    stop_msg = await msg.bot.send_message(
+        chat_id=chat_id,
+        text=t("game21_pvp_player_can_stop", lang).format(name=name_link, total=total),
+        reply_markup=play21_pvp_stop_keyboard(lang, int(st.get("owner_id") or 0)),
+    )
+    # Сохраняем message_id кнопки "Хватит", чтобы снять ее при следующем броске,
+    # если пользователь кнопку не нажал.
+    st["stop_button_message_id"] = stop_msg.message_id
+    st["stop_button_uid"] = uid
+    st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+    _pvp_live_games[chat_id] = st
+    asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+    return True
+
+
+async def _finish_21_game(bot: Bot, user_id: int, lang: str, state: dict, forced_result: str = None):
+    """Завершить 21 против бота и отправить итог."""
+    from db.queries import update_external_user_balance
+    player_total = int(state.get("player_total") or 0)
+    bot_total = int(state.get("bot_total") or 0)
+    bet = float(state.get("bet_amount") or 0)
+    commission_percent = float(state.get("commission_percent") or 0.0)
+    gross_payout = bet * 2
+    net_payout = round(gross_payout * (1 - commission_percent / 100.0), 2)
+    result_code = "lose"
+    winner = "BOT"
+    net_result = -bet
+    # Исходы по ТЗ
+    if forced_result == "lose":
+        result_code = "lose"
+        net_result = -bet
+        text = t("game21_result_lose", lang)
+    elif player_total > 21:
+        result_code = "lose"
+        net_result = -bet
+        text = t("game21_result_lose", lang)
+    elif bot_total > 21:
+        # победа игрока (возвращаем ставку + выигрыш)
+        update_external_user_balance(user_id, net_payout)
+        result_code = "win"
+        winner = str(user_id)
+        net_result = round(net_payout - bet, 2)
+        text = t("game21_result_win", lang)
+    elif player_total < bot_total:
+        result_code = "lose"
+        net_result = -bet
+        text = t("game21_result_lose", lang)
+    elif player_total == bot_total:
+        # ничья (возвращаем ставку)
+        update_external_user_balance(user_id, bet)
+        result_code = "draw"
+        winner = "DRAW"
+        net_result = 0.0
+        text = t("game21_result_draw", lang)
+    else:
+        # player_total > bot_total
+        update_external_user_balance(user_id, net_payout)
+        result_code = "win"
+        winner = str(user_id)
+        net_result = round(net_payout - bet, 2)
+        text = t("game21_result_win", lang)
+    # Сохраняем результаты раунда 21 в основной БД
+    try:
+        from db.queries import add_21_bot_round, close_21_bot_session
+        session_id = state.get("session_id")
+        player_throws = state.get("player_throws") or []
+        bot_throws = state.get("bot_throws") or []
+        if session_id:
+            add_21_bot_round(
+                session_id=session_id,
+                round_number=1,
+                player_cards=",".join(str(v) for v in player_throws),
+                bot_cards=",".join(str(v) for v in bot_throws),
+                player_points=player_total,
+                bot_points=bot_total,
+                result=result_code,
+                winner=winner,
+                bet_amount=bet,
+                commission_percent=commission_percent,
+                net_result=net_result,
+            )
+            close_21_bot_session(session_id, result_code, winner, net_result)
+    except Exception:
+        pass
+    _user_clear(user_id)
+    await bot.send_message(chat_id=user_id, text=text, reply_markup=play21_menu_keyboard(lang))
+
+
+async def _start_21_bot_turn(bot: Bot, user_id: int, lang: str):
+    """Ход бота: бросает, пока не наберёт >= результата пользователя (или не переберёт)."""
+    st = _user_state.get(user_id) or {}
+    if st.get("state") != "play21_player_turn_done":
+        return
+    player_total = int(st.get("player_total") or 0)
+    st["state"] = "play21_bot_turn"
+    st["bot_total"] = 0
+    st["bot_throws"] = []
+    _user_state[user_id] = st
+    await bot.send_message(chat_id=user_id, text=t("game21_bot_turn_start", lang))
+    while True:
+        await asyncio.sleep(1)
+        d = await bot.send_dice(chat_id=user_id, emoji="🎲")
+        st = _user_state.get(user_id) or {}
+        val = int(getattr(d.dice, "value", 0) or 0)
+        st["bot_total"] = int(st.get("bot_total") or 0) + val
+        throws = list(st.get("bot_throws") or [])
+        throws.append(val)
+        st["bot_throws"] = throws
+        _user_state[user_id] = st
+        await bot.send_message(chat_id=user_id, text=t("game21_bot_result", lang).format(total=st["bot_total"]))
+        if st["bot_total"] > 21:
+            break
+        if st["bot_total"] >= player_total:
+            break
+    st = _user_state.get(user_id) or {}
+    await _finish_21_game(bot, user_id, lang, st)
+
+
+def _arm_21_player_timeout(bot: Bot, user_id: int):
+    """Запустить/перезапустить таймер 5 минут на действие игрока в 21."""
+    st = _user_state.get(user_id) or {}
+    if st.get("state") != "play21_player_turn":
+        return
+    # Уникальный токен защищает от срабатывания старых задач таймаута из прошлых игр
+    st["player_timeout_token"] = time.time_ns()
+    token = st["player_timeout_token"]
+    _user_state[user_id] = st
+    asyncio.create_task(_timeout_21_player_turn(bot, user_id, token))
+
+
+async def _timeout_21_player_turn(bot: Bot, user_id: int, token: int):
+    """Если игрок 5 минут не бросает/не действует в фазе player_turn — поражение."""
+    await asyncio.sleep(300)
+    st = _user_state.get(user_id) or {}
+    if st.get("state") != "play21_player_turn":
+        return
+    if st.get("player_timeout_token") != token:
+        return
+    try:
+        from db.queries import get_user
+        u = get_user(user_id) or {}
+        lang = u.get("language_code") or DEFAULT_LANG
+    except Exception:
+        lang = DEFAULT_LANG
+    st["player_total"] = int(st.get("player_total") or 0)
+    st["bot_total"] = int(st.get("bot_total") or 0)
+    await _finish_21_game(bot, user_id, lang, st, forced_result="lose")
+
+
 async def cmd_start(msg: Message):
     from db.queries import get_user, save_user
     user_id = msg.from_user.id
@@ -505,7 +1228,7 @@ async def cmd_start(msg: Message):
     logger.info("cmd_start: existing user %s, sending welcome", user_id)
     _admin_clear(user_id)
     await msg.answer(
-        t("welcome_menu", lang),
+        _welcome_text_with_profile(lang, user_id),
         reply_markup=main_menu_keyboard(lang, user_id),
     )
 
@@ -527,7 +1250,7 @@ async def on_lang_chosen(cb: CallbackQuery):
             language_code=value,
         )
         await cb.message.edit_text(
-            t("welcome_menu", value),
+            _welcome_text_with_profile(value, user_id),
             reply_markup=main_menu_keyboard(value, user_id),
         )
         await cb.answer()
@@ -639,9 +1362,401 @@ async def on_menu(cb: CallbackQuery):
         title = t("signup_upcoming_title", lang) if games else t("signup_no_games", lang)
         await cb.message.edit_text(title, reply_markup=signup_games_keyboard(lang))
         await cb.answer()
+    elif action == "play21bot":
+        from db.queries import is_21_vs_bot_enabled, is_21_vs_users_enabled
+        try:
+            bot_enabled = is_21_vs_bot_enabled()
+        except Exception:
+            bot_enabled = False
+        try:
+            users_enabled = is_21_vs_users_enabled()
+        except Exception:
+            users_enabled = False
+        if not bot_enabled and not users_enabled:
+            await cb.answer(t("game21_coming_soon_all_off", lang), show_alert=True)
+            return
+        await _send_fresh_callback(
+            cb,
+            t("game21_menu_title", lang),
+            reply_markup=play21_menu_keyboard(lang),
+        )
+        await cb.answer()
+    elif action == "play21bot:rules":
+        from db.queries import is_21_vs_bot_enabled, is_21_vs_users_enabled
+        try:
+            bot_enabled = is_21_vs_bot_enabled()
+        except Exception:
+            bot_enabled = True
+        try:
+            users_enabled = is_21_vs_users_enabled()
+        except Exception:
+            users_enabled = True
+
+        try:
+            chat = await cb.bot.get_chat(CHAT_ID)
+            chat_title = getattr(chat, "title", None) or str(CHAT_ID)
+        except Exception:
+            chat_title = str(CHAT_ID)
+        parts = []
+        if bot_enabled:
+            parts.append(t("game21_rules_bot", lang))
+        if users_enabled:
+            parts.append(t("game21_rules_users", lang).format(chat_title=chat_title))
+        if not parts:
+            text = t("game21_rules", lang)
+        else:
+            text = t("game21_rules_title", lang) + "\n\n" + "\n\n".join(parts)
+
+        await _send_fresh_callback(cb, text, reply_markup=play21_rules_keyboard(lang))
+        await cb.answer()
+    elif action == "play21bot:bot":
+        from db.queries import is_21_vs_bot_enabled
+        if not is_21_vs_bot_enabled():
+            await cb.answer(t("game21_coming_soon_play", lang), show_alert=True)
+            return
+        _user_state[cb.from_user.id] = {"state": "play21_wait_bet"}
+        await _send_fresh_callback(
+            cb,
+            t("game21_enter_bet", lang),
+            reply_markup=play21_rules_keyboard(lang),
+        )
+        await cb.answer()
+    elif action == "play21bot:pvp":
+        from db.queries import is_21_vs_users_enabled
+        try:
+            if not is_21_vs_users_enabled():
+                await cb.answer(t("game21_coming_soon_pvp", lang), show_alert=True)
+                return
+        except Exception:
+            pass
+        # Запрет запуска второго PvP, если в чате уже идет поиск/матч
+        try:
+            active_live = bool(_pvp_live_games.get(CHAT_ID))
+        except Exception:
+            active_live = False
+        active_search = any((req or {}).get("chat_id") == CHAT_ID for req in _pvp_search_state.values())
+        if active_live or active_search:
+            await cb.answer(t("game21_pvp_active_exists", lang), show_alert=True)
+            return
+        # Запрет PvP, если в чате уже идёт основная игра (games.status == 'active')
+        try:
+            from db.init_db import get_connection
+
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM games WHERE status = 'active' AND chat_id = %s LIMIT 1", (CHAT_ID,))
+                    row = cur.fetchone()
+                    if row:
+                        await cb.answer(t("game21_pvp_main_active_exists", lang), show_alert=True)
+                        return
+        except Exception:
+            # Если по какой-то причине проверка не удалась — не блокируем PvP.
+            pass
+        # Разрешаем PvP только участникам чата
+        try:
+            chat = await cb.bot.get_chat(CHAT_ID)
+            chat_title = getattr(chat, "title", None) or str(CHAT_ID)
+            member = await cb.bot.get_chat_member(CHAT_ID, cb.from_user.id)
+            if isinstance(member, (ChatMemberLeft, ChatMemberBanned)):
+                await cb.answer(
+                    t("game21_pvp_chat_only", lang).format(chat_title=chat_title),
+                    show_alert=True,
+                )
+                return
+        except Exception:
+            # Если не смогли проверить членство — считаем, что пользователь не допущен
+            await cb.answer(
+                t("game21_pvp_chat_only", lang).format(chat_title=CHAT_ID),
+                show_alert=True,
+            )
+            return
+        _user_state[cb.from_user.id] = {"state": "play21_pvp_wait_bet"}
+        await _send_fresh_callback(
+            cb,
+            t("game21_pvp_enter_bet", lang),
+            reply_markup=play21_rules_keyboard(lang),
+        )
+        await cb.answer()
+    elif action == "play21bot:pvp:confirm:yes":
+        st = _user_state.get(cb.from_user.id) or {}
+        if st.get("state") != "play21_pvp_wait_confirm":
+            await cb.answer()
+            return
+        amount = float(st.get("bet_amount") or 0)
+        commission = float(st.get("commission_percent") or 0.0)
+        from db.queries import get_external_user_balance, update_external_user_balance
+        bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
+        try:
+            balance_val = float(bal) if bal is not None else 0.0
+        except Exception:
+            balance_val = 0.0
+        if balance_val < amount:
+            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+            return
+        ok = update_external_user_balance(cb.from_user.id, -amount)
+        if not ok:
+            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+            return
+        amount_str = _format_money(amount)
+        possible_win = float(st.get("possible_win") or round((amount * 2) * (1 - commission / 100.0), 2))
+        win_str = _format_money(possible_win)
+        timeout_token = int(time.time() * 1000)
+        display_name = (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id)
+        user_link = f'<a href="tg://user?id={cb.from_user.id}">{html.escape(display_name)}</a>'
+        _pvp_search_state[cb.from_user.id] = {
+            "owner_user_id": cb.from_user.id,
+            "bet_amount": amount,
+            "chat_id": CHAT_ID,
+            "created_at": time.time(),
+            "search_timeout_token": timeout_token,
+            "lang": lang,
+            "owner_name": (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id),
+        }
+        posted_msg = None
+        try:
+            posted_msg = await cb.bot.send_message(
+                chat_id=CHAT_ID,
+                text=t("game21_pvp_search_post", lang).format(user=user_link, amount=amount_str, win=win_str),
+                reply_markup=play21_pvp_accept_keyboard(lang, cb.from_user.id),
+            )
+        except Exception:
+            posted_msg = None
+        if posted_msg:
+            _pvp_search_state[cb.from_user.id]["message_id"] = posted_msg.message_id
+            try:
+                await cb.bot.pin_chat_message(chat_id=CHAT_ID, message_id=posted_msg.message_id)
+            except Exception:
+                pass
+        # Таймер отмены заявки, если никто не нажал "Принять"
+        asyncio.create_task(_pvp_search_timeout(cb.bot, cb.from_user.id, timeout_token))
+        # Личное сообщение инициатору о списании ставки
+        try:
+            await cb.bot.send_message(
+                chat_id=cb.from_user.id,
+                text=t("game21_pvp_pm_bet_deducted", lang).format(amount=amount_str),
+            )
+        except Exception:
+            pass
+        _user_clear(cb.from_user.id)
+        await _send_fresh_callback(
+            cb,
+            t("game21_pvp_search_started", lang),
+            reply_markup=play21_menu_keyboard(lang),
+        )
+        await cb.answer()
+    elif action == "play21bot:pvp:confirm:no":
+        _user_clear(cb.from_user.id)
+        await _send_fresh_callback(
+            cb,
+            t("game21_cancelled", lang),
+            reply_markup=play21_menu_keyboard(lang),
+        )
+        await cb.answer()
+    elif action.startswith("play21bot:pvp:accept:"):
+        parts = action.split(":")
+        if len(parts) < 4:
+            await cb.answer()
+            return
+        try:
+            owner_id = int(parts[3])
+        except Exception:
+            await cb.answer()
+            return
+        if cb.from_user.id == owner_id:
+            await cb.answer(t("game21_pvp_self_accept_forbidden", lang), show_alert=True)
+            return
+        req = _pvp_search_state.get(owner_id) or {}
+        if not req:
+            await cb.answer(t("game21_cancelled", lang), show_alert=True)
+            return
+        if req.get("accepted_by"):
+            await cb.answer(t("game21_cancelled", lang), show_alert=True)
+            return
+        amount = float(req.get("bet_amount") or 0.0)
+        from db.queries import get_external_user_balance, update_external_user_balance, get_21_users_commission_percent
+        bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
+        try:
+            balance_val = float(bal) if bal is not None else 0.0
+        except Exception:
+            balance_val = 0.0
+        if balance_val < amount:
+            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+            return
+        ok = update_external_user_balance(cb.from_user.id, -amount)
+        if not ok:
+            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+            return
+        req["accepted_by"] = cb.from_user.id
+        _pvp_search_state[owner_id] = req
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        amount_str = _format_money(amount)
+        # Личное сообщение второму игроку о списании ставки
+        try:
+            await cb.bot.send_message(
+                chat_id=cb.from_user.id,
+                text=t("game21_pvp_pm_bet_deducted", game_lang).format(amount=amount_str),
+            )
+        except Exception:
+            pass
+        owner_name = (req.get("owner_name") or str(owner_id)).strip()
+        second_name = (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id)
+        owner_link = _name_link(owner_id, owner_name)
+        second_link = _name_link(cb.from_user.id, second_name)
+        game_lang = req.get("lang") or DEFAULT_LANG
+        commission = float(get_21_users_commission_percent() or 0.0)
+        game_chat_id = int(req.get("chat_id") or CHAT_ID)
+        _pvp_live_games[game_chat_id] = {
+            "owner_id": owner_id,
+            "player1_id": owner_id,
+            "player2_id": cb.from_user.id,
+            "chat_id": game_chat_id,
+            "bet_amount": amount,
+            "commission_percent": commission,
+            "phase": "decide_first",
+            "decide_rolls": {},
+            "lang": game_lang,
+            "names": {
+                owner_id: owner_name,
+                cb.from_user.id: second_name,
+            },
+            "pinned_message_id": req.get("message_id"),
+            "throw_order_seq": 0,
+            "round_events": [],
+        }
+        _pvp_search_state.pop(owner_id, None)
+        await cb.bot.send_message(
+            chat_id=game_chat_id,
+            text=t("game21_pvp_started", game_lang).format(p1=owner_link, p2=second_link, amount=amount_str),
+        )
+        try:
+            chat_obj = await cb.bot.get_chat(game_chat_id)
+            chat_title = getattr(chat_obj, "title", None) or str(game_chat_id)
+        except Exception:
+            chat_title = str(game_chat_id)
+        await cb.bot.send_message(
+            chat_id=game_chat_id,
+            text=t("game21_rules_users", game_lang).format(chat_title=chat_title),
+        )
+        await cb.bot.send_message(chat_id=game_chat_id, text=t("game21_pvp_decide_first", game_lang))
+        await cb.answer()
+    elif action.startswith("play21bot:pvp:stop:"):
+        parts = action.split(":")
+        if len(parts) < 4:
+            await cb.answer()
+            return
+        try:
+            owner_id = int(parts[3])
+        except Exception:
+            await cb.answer()
+            return
+        game_chat_id = cb.message.chat.id if cb.message and cb.message.chat else CHAT_ID
+        st = _pvp_live_games.get(game_chat_id) or {}
+        if int(st.get("owner_id") or 0) != owner_id:
+            await cb.answer()
+            return
+        if st.get("phase") != "turn":
+            await cb.answer()
+            return
+        uid = cb.from_user.id
+        current_uid = int(st.get("current_turn_uid") or 0)
+        if uid != current_uid:
+            current_name = (st.get("names") or {}).get(current_uid, str(current_uid))
+            await cb.answer(t("round_turn_not_yours", lang).format(name=html.escape(current_name)), show_alert=True)
+            return
+        # Удаляем кнопку "Хватит" после нажатия активным игроком,
+        # чтобы она не оставалась в закрепленном сообщении/сообщении результата.
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        totals = st.get("totals") or {}
+        turns_done = dict(st.get("turns_done") or {})
+        other_uid = int(st.get("player2_id") or 0) if uid == int(st.get("player1_id") or 0) else int(st.get("player1_id") or 0)
+        if int(totals.get(uid) or 0) < 16:
+            await cb.answer()
+            return
+        # Для второго игрока кнопка "Хватит" появляется только при равенстве итогов.
+        if turns_done.get(other_uid):
+            if int(totals.get(uid) or 0) != int(totals.get(other_uid) or 0):
+                await cb.answer(t("game21_pvp_stop_only_on_equal", lang), show_alert=True)
+                return
+        st["turns_done"] = turns_done
+        st["turns_done"][uid] = True
+        st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+        _pvp_live_games[game_chat_id] = st
+        await cb.answer()
+        total = int(totals.get(uid) or 0)
+        name_link = _name_link(uid, (st.get("names") or {}).get(uid, str(uid)))
+        await cb.bot.send_message(
+            chat_id=game_chat_id,
+            text=t("game21_pvp_stop_announce", lang).format(name=name_link, total=total),
+        )
+        await _pvp_after_turn_end(cb.bot, game_chat_id, st, uid)
+    elif action == "play21bot:confirm:yes":
+        st = _user_state.get(cb.from_user.id) or {}
+        if st.get("state") != "play21_wait_confirm":
+            await cb.answer()
+            return
+        amount = float(st.get("bet_amount") or 0)
+        from db.queries import get_external_user_balance, update_external_user_balance
+        bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
+        try:
+            balance_val = float(bal) if bal is not None else 0.0
+        except Exception:
+            balance_val = 0.0
+        if balance_val < amount:
+            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+            return
+        # Списываем ставку до начала игры
+        ok = update_external_user_balance(cb.from_user.id, -amount)
+        if not ok:
+            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+            return
+        from db.queries import create_21_bot_session
+        commission_val = float(st.get("commission_percent") or 0.0)
+        session_id = create_21_bot_session(cb.from_user.id, amount, commission_val)
+        _user_state[cb.from_user.id] = {
+            "state": "play21_player_turn",
+            "bet_amount": amount,
+            "commission_percent": commission_val,
+            "player_total": 0,
+            "bot_total": 0,
+            "player_throws": [],
+            "bot_throws": [],
+            "session_id": session_id,
+        }
+        await _send_fresh_callback(cb, t("game21_rules", lang))
+        await cb.bot.send_message(chat_id=cb.from_user.id, text=t("game21_throw_now", lang))
+        _arm_21_player_timeout(cb.bot, cb.from_user.id)
+        await cb.answer()
+    elif action == "play21bot:confirm:no":
+        _user_clear(cb.from_user.id)
+        await _send_fresh_callback(
+            cb,
+            t("game21_cancelled", lang),
+            reply_markup=play21_menu_keyboard(lang),
+        )
+        await cb.answer()
+    elif action == "play21bot:stop":
+        st = _user_state.get(cb.from_user.id) or {}
+        if st.get("state") != "play21_player_turn":
+            await cb.answer()
+            return
+        total = int(st.get("player_total") or 0)
+        if total < 16:
+            await cb.answer()
+            return
+        st["state"] = "play21_player_turn_done"
+        _user_state[cb.from_user.id] = st
+        await cb.answer()
+        await _start_21_bot_turn(cb.bot, cb.from_user.id, lang)
     elif action == "signup:back" or action == "main":
+        _user_clear(cb.from_user.id)
         await cb.message.edit_text(
-            t("welcome_menu", lang),
+            _welcome_text_with_profile(lang, cb.from_user.id),
             reply_markup=main_menu_keyboard(lang, cb.from_user.id),
         )
         await cb.answer()
@@ -706,7 +1821,8 @@ async def on_menu(cb: CallbackQuery):
         else:
             await cb.answer(t("signup_already", lang), show_alert=True)
     elif action == "admin":
-        if cb.from_user.id != ADMIN_ID:
+        from db.queries import is_admin_user
+        if cb.from_user.id != ADMIN_ID and not is_admin_user(cb.from_user.id):
             await cb.answer()
             return
         _admin_clear(cb.from_user.id)
@@ -729,7 +1845,8 @@ async def on_menu(cb: CallbackQuery):
 
 async def on_admin(cb: CallbackQuery):
     """Обработка админ-меню: только для ADMIN_ID."""
-    if cb.from_user.id != ADMIN_ID:
+    from db.queries import is_admin_user
+    if cb.from_user.id != ADMIN_ID and not is_admin_user(cb.from_user.id):
         await cb.answer()
         return
     lang = _user_lang(cb)
@@ -750,10 +1867,114 @@ async def on_admin(cb: CallbackQuery):
     if data == "admin:settings21":
         _admin_clear(cb.from_user.id)
         await cb.message.edit_text(
-            t("coming_soon_settings_21", lang),
-            reply_markup=admin_main_keyboard(lang),
+            t("admin_21_title", lang),
+            reply_markup=admin_settings_21_keyboard(lang),
         )
         await cb.answer()
+        return
+    if data == "admin:add_admin":
+        _admin_state[cb.from_user.id] = {"state": "admin_add_admin_id"}
+        await cb.message.edit_text(
+            f"{t('admin_enter_admin_id', lang)}\n{t('admin_cancel_hint', lang)}",
+        )
+        await cb.answer()
+        return
+    if data == "admin:add_chat":
+        _admin_state[cb.from_user.id] = {"state": "admin_add_chat_id"}
+        await cb.message.edit_text(
+            f"{t('admin_enter_chat_id', lang)}\n{t('admin_cancel_hint', lang)}",
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:botmenu":
+        _admin_clear(cb.from_user.id)
+        await cb.message.edit_text(
+            t("admin_21_btn_vs_bot_menu", lang),
+            reply_markup=admin_settings_21_bot_keyboard(lang),
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:usersmenu":
+        _admin_clear(cb.from_user.id)
+        await cb.message.edit_text(
+            t("admin_21_btn_vs_players_menu", lang),
+            reply_markup=admin_settings_21_users_keyboard(lang),
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:vsbot":
+        from db.queries import is_21_vs_bot_enabled, set_21_vs_bot_enabled
+        try:
+            current = is_21_vs_bot_enabled()
+            set_21_vs_bot_enabled(not current)
+            await cb.answer(t("admin_21_status_updated", lang), show_alert=True)
+        except Exception:
+            await cb.answer()
+        await cb.message.edit_text(
+            t("admin_21_btn_vs_bot_menu", lang),
+            reply_markup=admin_settings_21_bot_keyboard(lang),
+        )
+        return
+    if data == "admin:settings21:fee":
+        _admin_state[cb.from_user.id] = {"state": "admin_21_fee_input_bot"}
+        await cb.message.edit_text(
+            f"{t('admin_21_fee_enter', lang)}\n{t('admin_cancel_hint', lang)}",
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:vsplayers":
+        from db.queries import is_21_vs_users_enabled, set_21_users_enabled
+        try:
+            current = is_21_vs_users_enabled()
+            set_21_users_enabled(not current)
+            await cb.answer(t("admin_21_status_updated_users", lang), show_alert=True)
+        except Exception:
+            await cb.answer()
+        await cb.message.edit_text(
+            t("admin_21_btn_vs_players_menu", lang),
+            reply_markup=admin_settings_21_users_keyboard(lang),
+        )
+        return
+    if data in ("admin:settings21:stats",):
+        from db.queries import get_21_bot_stats
+        stats = get_21_bot_stats()
+        text = t("admin_21_stats_text", lang).format(
+            total_games=stats["total_games"],
+            bot_wins_count=stats["bot_wins_count"],
+            bot_wins_sum=_format_money(stats["bot_wins_sum"]),
+            bot_losses_count=stats["bot_losses_count"],
+            bot_losses_sum=_format_money(stats["bot_losses_sum"]),
+            draws_count=stats["draws_count"],
+            bot_profit=_format_money(stats["bot_profit"]),
+        )
+        await cb.answer()
+        await cb.message.edit_text(
+            text,
+            reply_markup=admin_settings_21_bot_keyboard(lang),
+        )
+        return
+    if data == "admin:settings21:users:fee":
+        _admin_state[cb.from_user.id] = {"state": "admin_21_fee_input_users"}
+        await cb.message.edit_text(
+            f"{t('admin_21_fee_enter', lang)}\n{t('admin_cancel_hint', lang)}",
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:users:stats":
+        from db.queries import get_21_users_stats
+        stats = get_21_users_stats()
+        text = t("admin_21_users_stats_text", lang).format(
+            total_games=stats["total_games"],
+            bot_commission_sum=_format_money(stats["bot_commission_sum"]),
+        )
+        kb = InlineKeyboardBuilder()
+        kb.add(
+            InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:settings21:usersmenu"),
+            InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
+        )
+        kb.adjust(2)
+        await cb.answer()
+        await cb.message.edit_text(text, reply_markup=kb.as_markup())
         return
     if data == "admin:games:past":
         _admin_clear(cb.from_user.id)
@@ -1080,7 +2301,7 @@ async def on_admin(cb: CallbackQuery):
     if data == "admin:main":
         _admin_clear(cb.from_user.id)
         await cb.message.edit_text(
-            t("welcome_menu", lang),
+            _welcome_text_with_profile(lang, cb.from_user.id),
             reply_markup=main_menu_keyboard(lang, cb.from_user.id),
         )
         await cb.answer()
@@ -1182,14 +2403,40 @@ async def on_admin(cb: CallbackQuery):
 
 async def on_admin_message(msg: Message):
     """Обработка текста от админа в состоянии создания/редактирования города."""
-    if msg.from_user.id != ADMIN_ID:
-        return
     state = _admin_state.get(msg.from_user.id)
     if not state:
+        return
+    from db.queries import is_admin_user
+    if msg.from_user.id != ADMIN_ID and not is_admin_user(msg.from_user.id):
         return
     lang = _user_lang(msg)
     text = (msg.text or msg.caption or "").strip()
     has_photo = bool(msg.photo)
+    if state.get("state") in ("admin_add_admin_id", "admin_add_chat_id"):
+        if text == "/back":
+            _admin_clear(msg.from_user.id)
+            await msg.answer(t("admin_title", lang), reply_markup=admin_main_keyboard(lang))
+            return
+        try:
+            val = int(text)
+        except Exception:
+            key = "admin_add_admin_invalid" if state.get("state") == "admin_add_admin_id" else "admin_add_chat_invalid"
+            await msg.answer(t(key, lang))
+            return
+        if state.get("state") == "admin_add_admin_id":
+            from db.queries import add_admin_user, save_user
+            save_user(val, None, None)
+            add_admin_user(val)
+            _admin_clear(msg.from_user.id)
+            await msg.answer(t("admin_add_admin_ok", lang).format(user_id=val), reply_markup=admin_main_keyboard(lang))
+            return
+        from db.queries import set_active_chat_id
+        global CHAT_ID
+        CHAT_ID = val
+        set_active_chat_id(val)
+        _admin_clear(msg.from_user.id)
+        await msg.answer(t("admin_add_chat_ok", lang).format(chat_id=val), reply_markup=admin_main_keyboard(lang))
+        return
     if text == "/back":
         if state.get("state") == "admin_game_min_max":
             _admin_clear(msg.from_user.id)
@@ -1698,6 +2945,168 @@ async def on_admin_message(msg: Message):
     await msg.answer(t("admin_cities_title", lang), reply_markup=admin_cities_keyboard(lang))
 
 
+async def on_user_private_message(msg: Message):
+    """Текстовые шаги пользователя в личке (например ввод ставки 21 против бота)."""
+    if not msg.from_user:
+        return
+    if str(getattr(msg.chat, "type", "")).lower() != "private":
+        return
+    user_id = msg.from_user.id
+    # Админский ввод комиссии 21 в личке
+    from db.queries import is_admin_user
+    if user_id == ADMIN_ID or is_admin_user(user_id):
+        admin_state = _admin_state.get(user_id) or {}
+        if admin_state.get("state") in ("admin_add_admin_id", "admin_add_chat_id"):
+            lang = _user_lang(msg)
+            if (msg.text or "").strip() == "/back":
+                _admin_clear(user_id)
+                await msg.answer(t("admin_title", lang), reply_markup=admin_main_keyboard(lang))
+                return
+            raw = (msg.text or "").strip()
+            try:
+                val = int(raw)
+            except Exception:
+                key = "admin_add_admin_invalid" if admin_state.get("state") == "admin_add_admin_id" else "admin_add_chat_invalid"
+                await msg.answer(t(key, lang))
+                return
+            if admin_state.get("state") == "admin_add_admin_id":
+                from db.queries import add_admin_user, save_user
+                save_user(val, None, None)
+                add_admin_user(val)
+                _admin_clear(user_id)
+                await msg.answer(t("admin_add_admin_ok", lang).format(user_id=val), reply_markup=admin_main_keyboard(lang))
+                return
+            from db.queries import set_active_chat_id
+            global CHAT_ID
+            CHAT_ID = val
+            set_active_chat_id(val)
+            _admin_clear(user_id)
+            await msg.answer(t("admin_add_chat_ok", lang).format(chat_id=val), reply_markup=admin_main_keyboard(lang))
+            return
+        if admin_state.get("state") in ("admin_21_fee_input_bot", "admin_21_fee_input_users"):
+            lang = _user_lang(msg)
+            if (msg.text or "").strip() == "/back":
+                _admin_clear(user_id)
+                back_kb = admin_settings_21_bot_keyboard(lang) if admin_state.get("state") == "admin_21_fee_input_bot" else admin_settings_21_users_keyboard(lang)
+                await msg.answer(
+                    t("admin_21_btn_vs_bot_menu", lang) if admin_state.get("state") == "admin_21_fee_input_bot" else t("admin_21_btn_vs_players_menu", lang),
+                    reply_markup=back_kb,
+                )
+                return
+            raw = (msg.text or "").strip().replace(",", ".")
+            try:
+                val = float(raw)
+            except Exception:
+                val = None
+            if val is None or val < 0 or val > 100:
+                await msg.answer(t("admin_21_fee_invalid", lang))
+                return
+            if admin_state.get("state") == "admin_21_fee_input_bot":
+                from db.queries import set_21_bot_commission_percent
+                set_21_bot_commission_percent(float(val))
+                back_kb = admin_settings_21_bot_keyboard(lang)
+            else:
+                from db.queries import set_21_users_commission_percent
+                set_21_users_commission_percent(float(val))
+                back_kb = admin_settings_21_users_keyboard(lang)
+            _admin_clear(user_id)
+            await msg.answer(
+                t("admin_21_fee_saved", lang).format(percent=_format_money(float(val))),
+                reply_markup=back_kb,
+            )
+            return
+    state = _user_state.get(user_id) or {}
+    if state.get("state") == "play21_pvp_wait_bet":
+        lang = _user_lang(msg)
+        amount = _parse_amount(msg.text or "")
+        if amount is None:
+            await msg.answer(t("game21_bet_invalid", lang))
+            await msg.answer(t("game21_pvp_enter_bet", lang), reply_markup=play21_rules_keyboard(lang))
+            return
+        from db.queries import get_21_users_commission_percent
+        commission = float(get_21_users_commission_percent() or 0.0)
+        gross = float(amount) * 2
+        possible_win = round(gross * (1 - commission / 100.0), 2)
+        _user_state[user_id] = {
+            "state": "play21_pvp_wait_confirm",
+            "bet_amount": amount,
+            "commission_percent": commission,
+            "possible_win": possible_win,
+        }
+        amount_str = str(int(amount)) if float(amount).is_integer() else f"{amount:.2f}".rstrip("0").rstrip(".")
+        win_str = _format_money(possible_win)
+        await msg.answer(
+            t("game21_pvp_confirm", lang).format(amount=amount_str, win=win_str),
+            reply_markup=play21_pvp_confirm_keyboard(lang),
+        )
+        return
+    if state.get("state") != "play21_wait_bet":
+        return
+    lang = _user_lang(msg)
+    amount = _parse_amount(msg.text or "")
+    if amount is None:
+        await msg.answer(t("game21_bet_invalid", lang))
+        await msg.answer(t("game21_enter_bet", lang), reply_markup=play21_rules_keyboard(lang))
+        return
+    from db.queries import get_21_bot_commission_percent
+    commission = float(get_21_bot_commission_percent() or 0.0)
+    gross = float(amount) * 2
+    possible_win = round(gross * (1 - commission / 100.0), 2)
+    _user_state[user_id] = {
+        "state": "play21_wait_confirm",
+        "bet_amount": amount,
+        "commission_percent": commission,
+        "possible_win": possible_win,
+    }
+    amount_str = str(int(amount)) if float(amount).is_integer() else f"{amount:.2f}".rstrip("0").rstrip(".")
+    win_str = _format_money(possible_win)
+    await msg.answer(
+        t("game21_confirm_bet_with_win", lang).format(amount=amount_str, win=win_str),
+        reply_markup=play21_confirm_keyboard(lang),
+    )
+
+
+async def on_user_private_dice(msg: Message):
+    """Броски кубика пользователем в личке для режима 21 против бота."""
+    if not msg.from_user or str(getattr(msg.chat, "type", "")).lower() != "private":
+        return
+    # Пересланные сообщения не учитываем как результат броска
+    if getattr(msg, "forward_date", None) is not None or getattr(msg, "forward_origin", None) is not None:
+        return
+    user_id = msg.from_user.id
+    state = _user_state.get(user_id) or {}
+    if state.get("state") != "play21_player_turn":
+        return
+    if not msg.dice or getattr(msg.dice, "emoji", None) != "🎲":
+        return
+    lang = _user_lang(msg)
+    state["player_total"] = int(state.get("player_total") or 0) + int(msg.dice.value or 0)
+    throws = list(state.get("player_throws") or [])
+    throws.append(int(msg.dice.value or 0))
+    state["player_throws"] = throws
+    total = int(state["player_total"])
+    _user_state[user_id] = state
+    if total > 21:
+        await msg.answer(t("game21_player_busted", lang).format(total=total))
+        await _finish_21_game(msg.bot, user_id, lang, state)
+        return
+    if total == 21:
+        state["state"] = "play21_player_turn_done"
+        _user_state[user_id] = state
+        await msg.answer(t("game21_player_blackjack", lang))
+        await _start_21_bot_turn(msg.bot, user_id, lang)
+        return
+    if total < 16:
+        await msg.answer(t("game21_player_result", lang).format(total=total))
+        _arm_21_player_timeout(msg.bot, user_id)
+        return
+    await msg.answer(
+        t("game21_player_can_stop", lang).format(total=total),
+        reply_markup=play21_stop_keyboard(lang),
+    )
+    _arm_21_player_timeout(msg.bot, user_id)
+
+
 async def on_city_chosen(cb: CallbackQuery):
     from db.queries import get_user, save_user
     lang = _user_lang(cb)
@@ -1717,7 +3126,7 @@ async def on_city_chosen(cb: CallbackQuery):
         language_code=saved_lang,
     )
     await cb.message.edit_text(
-        t("welcome_menu", saved_lang),
+        _welcome_text_with_profile(saved_lang, user_id),
         reply_markup=main_menu_keyboard(saved_lang, user_id),
     )
     await cb.answer()
@@ -1894,9 +3303,12 @@ async def announce_game_start(bot: Bot, game: dict):
         "3. После каждого броска бот показывает ваш результат и суммарный результат за текущий раунд.\n"
         "4. По окончании раунда считается общий результат каждого игрока.\n"
         "5. Игроки, набравшие не меньше проходного балла, переходят в следующий раунд.\n"
-        "6. В финальном раунде определяется победитель(и) по наибольшему общему результату.\n"
-        "7. При равенстве результатов могут быть назначены дополнительные броски.\n"
-        "8. Организатор оставляет за собой право изменять правила и проходной балл до начала следующей игры."
+        "6. В финальном раунде определяется победитель(и) по наибольшему результату финального раунда.\n"
+        "7. На бросок дается 2 минуты.\n"
+        "8. Участники, пропустившие свой ход, получат еще один шанс после того, как все участники раунда сделают свой ход.\n"
+        "9. На бросок опоздавших дается 1 минута.\n"
+        "10. При равенстве результатов могут быть назначены дополнительные броски.\n"
+        "11. Организатор оставляет за собой право изменять правила и проходной балл до начала следующей игры."
     )
     try:
         await bot.send_message(chat_id=chat_id, text=rules_text)
@@ -2190,6 +3602,11 @@ async def _process_one_throw(bot: Bot, chat_id: int, game_id: int, state: dict, 
 
 async def on_dice_message(msg: Message):
     """Обработка броска (dice) в чате: текущий участник раунда или фаза доп. времени (catchup)."""
+    # Пересланные сообщения не учитываем как результат броска
+    if getattr(msg, "forward_date", None) is not None or getattr(msg, "forward_origin", None) is not None:
+        return
+    if await _handle_pvp_dice(msg):
+        return
     chat_id = msg.chat.id
     user_id = msg.from_user.id if msg.from_user else None
     dice_emoji = getattr(msg.dice, "emoji", None) if getattr(msg, "dice", None) else None
@@ -2733,10 +4150,9 @@ async def on_startup(bot: Bot):
 
 
 async def main():
+    global CHAT_ID
     if not BOT_TOKEN:
         raise SystemExit("Задай BOT_TOKEN в .env")
-    if not CHAT_ID:
-        raise SystemExit("Задай CHAT_ID в .env")
 
     try:
         from db.init_db import create_tables
@@ -2745,10 +4161,29 @@ async def main():
     except Exception as e:
         logger.warning("БД недоступна или таблицы не созданы: %s", e)
 
+    # Активный чат теперь храним в БД (с fallback на env)
+    try:
+        from db.queries import get_active_chat_id, set_active_chat_id
+        db_chat_id = get_active_chat_id()
+        if db_chat_id:
+            CHAT_ID = int(db_chat_id)
+        elif CHAT_ID:
+            set_active_chat_id(int(CHAT_ID))
+        else:
+            raise SystemExit("Сначала добавьте чат через админку: «Добавить чат».")
+    except Exception:
+        if not CHAT_ID:
+            raise SystemExit("Сначала добавьте чат через админку: «Добавить чат».")
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    # При старте очищаем накопившиеся апдейты, чтобы не обрабатывать старый "хвост"
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning("delete_webhook(drop_pending_updates=True) failed: %s", e)
     dp = Dispatcher()
     dp.startup.register(on_startup)
     dp.message.middleware(ChatFilter(CHAT_ID))
@@ -2756,9 +4191,13 @@ async def main():
     dp.callback_query.middleware(ChatFilter(CHAT_ID))
     dp.message.register(cmd_start, F.text == "/start")
     # Сначала броски из меню (dice): и админ, и игроки — бросок должен обрабатывать игра, а не админка
-    dp.message.register(on_dice_message, (F.content_type == ContentType.DICE) | F.dice)
-    # Текст от админа (создание игры, призы и т.д.)
-    dp.message.register(on_admin_message, F.from_user.id == ADMIN_ID)
+    dp.message.register(on_dice_message, (F.content_type == ContentType.DICE) | F.dice, F.chat.type != "private")
+    # Текст от админа (создание игры, призы и т.д.) только вне лички
+    dp.message.register(on_admin_message, F.chat.type != "private")
+    # Текст от пользователей в личке (например ставка 21 против бота)
+    dp.message.register(on_user_private_message, F.text, F.chat.type == "private")
+    # Броски пользователей в личке для 21 против бота
+    dp.message.register(on_user_private_dice, (F.content_type == ContentType.DICE) | F.dice, F.chat.type == "private")
     # Текст 🎲/🎳/🎯 (эмодзи вручную)
     dp.message.register(on_game_emoji_text, F.text)
     dp.callback_query.register(on_lang_chosen, F.data.startswith("lang:"))

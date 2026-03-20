@@ -109,6 +109,13 @@ TABLES = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        `key` VARCHAR(64) NOT NULL PRIMARY KEY,
+        `value` VARCHAR(255) NULL,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
     CREATE TABLE IF NOT EXISTS user_prizes (
         id INT AUTO_INCREMENT PRIMARY KEY,
         user_id BIGINT NOT NULL,
@@ -121,6 +128,85 @@ TABLES = [
         FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE,
         INDEX idx_user_id (user_id),
         INDEX idx_game_id (game_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game21_bot_settings (
+        id TINYINT NOT NULL PRIMARY KEY,
+        enabled TINYINT(1) NOT NULL DEFAULT 0,
+        enabled_users TINYINT(1) NOT NULL DEFAULT 1,
+        commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+        commission_users_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game21_bot_sessions (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'active',
+        bet_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+        result VARCHAR(20) NULL,
+        winner VARCHAR(32) NULL,
+        net_result DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        total_rounds INT NOT NULL DEFAULT 0,
+        total_wins INT NOT NULL DEFAULT 0,
+        total_losses INT NOT NULL DEFAULT 0,
+        total_draws INT NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+        INDEX idx_21_user (user_id),
+        INDEX idx_21_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game21_bot_rounds (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        session_id BIGINT NOT NULL,
+        round_number INT NOT NULL,
+        player_cards VARCHAR(255) NULL,
+        bot_cards VARCHAR(255) NULL,
+        player_points TINYINT NULL,
+        bot_points TINYINT NULL,
+        result VARCHAR(20) NULL,
+        winner VARCHAR(32) NULL,
+        bet_amount DECIMAL(10,2) NULL,
+        commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+        net_result DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (session_id) REFERENCES game21_bot_sessions(id) ON DELETE CASCADE,
+        INDEX idx_21_round_session (session_id, round_number)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game21_users_sessions (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        player1_id BIGINT NOT NULL,
+        player2_id BIGINT NOT NULL,
+        bet_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+        commission_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+        result VARCHAR(20) NOT NULL DEFAULT 'draw',
+        winner_id BIGINT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_21_users_created (created_at),
+        INDEX idx_21_users_winner (winner_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game21_users_rounds (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        session_id BIGINT NOT NULL,
+        phase VARCHAR(20) NOT NULL,
+        user_id BIGINT NOT NULL,
+        throw_order INT NOT NULL,
+        value TINYINT NOT NULL,
+        total_after INT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_21_users_rounds_session (session_id, throw_order),
+        INDEX idx_21_users_rounds_user (user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 ]
@@ -183,6 +269,50 @@ def _migrate_users_city_changed_at(cur):
     cur.execute("ALTER TABLE users ADD COLUMN city_changed_at DATETIME NULL AFTER city_id")
 
 
+def _migrate_21_commission_users_percent(cur):
+    """Добавить отдельную комиссию для режима 21 между пользователями."""
+    cur.execute("""
+        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'game21_bot_settings' AND COLUMN_NAME = 'commission_users_percent'
+    """, (MYSQL_DATABASE,))
+    if cur.fetchone():
+        return
+    cur.execute("ALTER TABLE game21_bot_settings ADD COLUMN commission_users_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER commission_percent")
+
+
+def _migrate_21_enabled_users(cur):
+    """Добавить флаг enabled_users для режима 21 против пользователей."""
+    cur.execute("""
+        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'game21_bot_settings' AND COLUMN_NAME = 'enabled_users'
+    """, (MYSQL_DATABASE,))
+    if cur.fetchone():
+        return
+    cur.execute("ALTER TABLE game21_bot_settings ADD COLUMN enabled_users TINYINT(1) NOT NULL DEFAULT 1 AFTER enabled")
+
+
+def _migrate_21_sessions_and_rounds(cur):
+    """Добавить недостающие поля в таблицы истории 21."""
+    for col_sql in [
+        ("game21_bot_sessions", "bet_amount", "ALTER TABLE game21_bot_sessions ADD COLUMN bet_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER status"),
+        ("game21_bot_sessions", "commission_percent", "ALTER TABLE game21_bot_sessions ADD COLUMN commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER bet_amount"),
+        ("game21_bot_sessions", "result", "ALTER TABLE game21_bot_sessions ADD COLUMN result VARCHAR(20) NULL AFTER commission_percent"),
+        ("game21_bot_sessions", "winner", "ALTER TABLE game21_bot_sessions ADD COLUMN winner VARCHAR(32) NULL AFTER result"),
+        ("game21_bot_sessions", "net_result", "ALTER TABLE game21_bot_sessions ADD COLUMN net_result DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER result"),
+        ("game21_bot_rounds", "commission_percent", "ALTER TABLE game21_bot_rounds ADD COLUMN commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER bet_amount"),
+        ("game21_bot_rounds", "winner", "ALTER TABLE game21_bot_rounds ADD COLUMN winner VARCHAR(32) NULL AFTER result"),
+        ("game21_bot_rounds", "net_result", "ALTER TABLE game21_bot_rounds ADD COLUMN net_result DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER commission_percent"),
+    ]:
+        table, col, alter = col_sql
+        cur.execute(
+            """SELECT COLUMN_NAME FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s""",
+            (MYSQL_DATABASE, table, col),
+        )
+        if not cur.fetchone():
+            cur.execute(alter)
+
+
 def create_tables():
     """Создать таблицы в БД (безопасно вызывать при каждом запуске — CREATE TABLE IF NOT EXISTS)."""
     conn = get_connection()
@@ -208,6 +338,18 @@ def create_tables():
                 pass
             try:
                 _migrate_users_city_changed_at(cur)
+            except Exception:
+                pass
+            try:
+                _migrate_21_commission_users_percent(cur)
+            except Exception:
+                pass
+            try:
+                _migrate_21_enabled_users(cur)
+            except Exception:
+                pass
+            try:
+                _migrate_21_sessions_and_rounds(cur)
             except Exception:
                 pass
         conn.commit()
