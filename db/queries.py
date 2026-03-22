@@ -665,6 +665,92 @@ def set_21_users_commission_percent(percent: float) -> bool:
             return True
 
 
+def get_21_rules_bot_text() -> Optional[str]:
+    """Кастомный HTML-текст правил «21 против бота» из БД или None (тогда — перевод по умолчанию)."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT rules_bot_text FROM game21_bot_settings WHERE id = 1")
+                row = cur.fetchone()
+                if not row:
+                    return None
+                r = row.get("rules_bot_text")
+                if r is None:
+                    return None
+                s = str(r).strip()
+                return s if s else None
+    except Exception:
+        return None
+
+
+def get_21_rules_users_text() -> Optional[str]:
+    """Кастомный HTML-текст правил «21 между пользователями» из БД или None."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT rules_users_text FROM game21_bot_settings WHERE id = 1")
+                row = cur.fetchone()
+                if not row:
+                    return None
+                r = row.get("rules_users_text")
+                if r is None:
+                    return None
+                s = str(r).strip()
+                return s if s else None
+    except Exception:
+        return None
+
+
+def set_21_rules_bot_text(text: Optional[str]) -> bool:
+    """Сохранить правила vs bot; пустая строка / None — сброс к переводу по умолчанию."""
+    val = (text or "").strip() or None
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM game21_bot_settings WHERE id = 1")
+                if cur.fetchone():
+                    cur.execute(
+                        "UPDATE game21_bot_settings SET rules_bot_text = %s WHERE id = 1",
+                        (val,),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO game21_bot_settings
+                           (id, enabled, enabled_users, commission_percent, commission_users_percent, rules_bot_text, rules_users_text)
+                           VALUES (1, 0, 1, 0.00, 0.00, %s, NULL)""",
+                        (val,),
+                    )
+                conn.commit()
+                return True
+    except Exception:
+        return False
+
+
+def set_21_rules_users_text(text: Optional[str]) -> bool:
+    """Сохранить правила vs users; пустая строка / None — сброс."""
+    val = (text or "").strip() or None
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM game21_bot_settings WHERE id = 1")
+                if cur.fetchone():
+                    cur.execute(
+                        "UPDATE game21_bot_settings SET rules_users_text = %s WHERE id = 1",
+                        (val,),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO game21_bot_settings
+                           (id, enabled, enabled_users, commission_percent, commission_users_percent, rules_bot_text, rules_users_text)
+                           VALUES (1, 0, 1, 0.00, 0.00, NULL, %s)""",
+                        (val,),
+                    )
+                conn.commit()
+                return True
+    except Exception:
+        return False
+
+
 def create_21_bot_session(user_id: int, bet_amount: float, commission_percent: float) -> Optional[int]:
     """Создать сессию 21 против бота."""
     with get_connection() as conn:

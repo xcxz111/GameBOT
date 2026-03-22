@@ -220,6 +220,46 @@ _user_state = {}
 _pvp_search_state = {}
 # Активные матчи 21 между пользователями: chat_id -> state
 _pvp_live_games = {}
+# Блокировки для атомарных действий PvP по чату (создание/принятие заявки)
+_pvp_chat_locks = {}
+
+
+def _get_pvp_chat_lock(chat_id: int) -> asyncio.Lock:
+    lock = _pvp_chat_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _pvp_chat_locks[chat_id] = lock
+    return lock
+
+
+def _is_main_game_blocking_pvp(chat_id: int) -> bool:
+    """
+    PvP запрещен, если:
+    - основная игра уже active
+    - или уже отправлено 5-минутное напоминание для draft-игры
+    """
+    try:
+        from db.init_db import get_connection
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM games
+                    WHERE chat_id = %s
+                      AND (
+                        status = 'active'
+                        OR (status = 'draft' AND reminder_5min_sent = 1)
+                      )
+                    LIMIT 1
+                    """,
+                    (chat_id,),
+                )
+                return bool(cur.fetchone())
+    except Exception:
+        # Если БД временно недоступна — не блокируем по этой причине.
+        return False
 
 
 def _admin_clear(user_id: int):
@@ -382,12 +422,13 @@ def admin_settings_21_bot_keyboard(lang) -> InlineKeyboardMarkup:
     toggle_text = t("admin_21_btn_vs_bot_on", lang) if enabled else t("admin_21_btn_vs_bot_off", lang)
     builder.add(InlineKeyboardButton(text=toggle_text, callback_data="admin:settings21:vsbot"))
     builder.add(InlineKeyboardButton(text=t("admin_21_btn_fee", lang), callback_data="admin:settings21:fee"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_edit_rules", lang), callback_data="admin:settings21:rules:bot"))
     builder.add(InlineKeyboardButton(text=t("admin_21_btn_stats", lang), callback_data="admin:settings21:stats"))
     builder.add(
         InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:settings21"),
         InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
     )
-    builder.adjust(1, 1, 1, 2)
+    builder.adjust(1, 1, 1, 1, 2)
     return builder.as_markup()
 
 
@@ -402,12 +443,13 @@ def admin_settings_21_users_keyboard(lang) -> InlineKeyboardMarkup:
     toggle_text = t("admin_21_btn_vs_users_on", lang) if enabled else t("admin_21_btn_vs_users_off", lang)
     builder.add(InlineKeyboardButton(text=toggle_text, callback_data="admin:settings21:vsplayers"))
     builder.add(InlineKeyboardButton(text=t("admin_21_btn_fee", lang), callback_data="admin:settings21:users:fee"))
+    builder.add(InlineKeyboardButton(text=t("admin_21_btn_edit_rules", lang), callback_data="admin:settings21:rules:users"))
     builder.add(InlineKeyboardButton(text=t("admin_21_btn_stats", lang), callback_data="admin:settings21:users:stats"))
     builder.add(
         InlineKeyboardButton(text=t("admin_btn_back", lang), callback_data="admin:settings21"),
         InlineKeyboardButton(text=t("admin_btn_main", lang), callback_data="admin:main"),
     )
-    builder.adjust(1, 1, 1, 2)
+    builder.adjust(1, 1, 1, 1, 2)
     return builder.as_markup()
 
 
@@ -729,20 +771,61 @@ def _name_link(user_id: int, name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{html.escape((name or "").strip() or str(user_id))}</a>'
 
 
+def _game21_rules_bot_display(lang: str) -> str:
+    """Правила «21 против бота»: из БД или перевод по умолчанию."""
+    try:
+        from db.queries import get_21_rules_bot_text
+
+        custom = get_21_rules_bot_text()
+        if custom:
+            return custom
+    except Exception:
+        pass
+    return t("game21_rules_bot", lang)
+
+
+def _game21_rules_users_display(lang: str, chat_title: str) -> str:
+    """Правила «21 между пользователями»: из БД или перевод. В кастомном тексте можно использовать {chat_title}."""
+    try:
+        from db.queries import get_21_rules_users_text
+
+        custom = get_21_rules_users_text()
+        if custom:
+            if "{chat_title}" in custom:
+                try:
+                    return custom.format(chat_title=chat_title)
+                except Exception:
+                    return custom
+            return custom
+    except Exception:
+        pass
+    return t("game21_rules_users", lang).format(chat_title=chat_title)
+
+
 async def _pvp_prompt_turn(bot: Bot, chat_id: int, st: dict):
     lang = st.get("lang") or DEFAULT_LANG
     uid = int(st.get("current_turn_uid") or 0)
     name = (st.get("names") or {}).get(uid, str(uid))
     await bot.send_message(chat_id=chat_id, text=t("game21_pvp_turn_prompt", lang).format(name=_name_link(uid, name)))
-    st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+    st["turn_timeout_token"] = time.time_ns()
     _pvp_live_games[chat_id] = st
-    asyncio.create_task(_pvp_turn_timeout(bot, chat_id, uid, st["turn_timeout_token"]))
+    asyncio.create_task(
+        _pvp_turn_timeout(
+            bot,
+            chat_id,
+            uid,
+            st["turn_timeout_token"],
+            int(st.get("pvp_session_token") or 0),
+        )
+    )
 
 
-async def _pvp_turn_timeout(bot: Bot, chat_id: int, uid: int, token: int):
+async def _pvp_turn_timeout(bot: Bot, chat_id: int, uid: int, token: int, session_token: int):
     await asyncio.sleep(300)
     st = _pvp_live_games.get(chat_id) or {}
     if st.get("phase") != "turn":
+        return
+    if int(st.get("pvp_session_token") or 0) != int(session_token):
         return
     if int(st.get("current_turn_uid") or 0) != int(uid):
         return
@@ -753,6 +836,56 @@ async def _pvp_turn_timeout(bot: Bot, chat_id: int, uid: int, token: int):
     p2 = int(st.get("player2_id") or 0)
     winner_id = p2 if loser_id == p1 else p1
     await _finish_21_pvp_game(bot, chat_id, st, winner_id=winner_id)
+
+
+def _arm_pvp_decide_timeout(bot: Bot, chat_id: int, st: dict):
+    st["decide_timeout_token"] = time.time_ns()
+    _pvp_live_games[chat_id] = st
+    asyncio.create_task(
+        _pvp_decide_first_timeout(
+            bot,
+            chat_id,
+            int(st["decide_timeout_token"]),
+            int(st.get("pvp_session_token") or 0),
+        )
+    )
+
+
+async def _pvp_decide_first_timeout(bot: Bot, chat_id: int, token: int, session_token: int):
+    """5 минут на броски в фазе определения первого хода."""
+    await asyncio.sleep(300)
+    st = _pvp_live_games.get(chat_id) or {}
+    if st.get("phase") != "decide_first":
+        return
+    if int(st.get("pvp_session_token") or 0) != int(session_token):
+        return
+    if int(st.get("decide_timeout_token") or 0) != int(token):
+        return
+    p1 = int(st.get("player1_id") or 0)
+    p2 = int(st.get("player2_id") or 0)
+    decide_rolls = dict(st.get("decide_rolls") or {})
+    rolled_p1 = p1 in decide_rolls
+    rolled_p2 = p2 in decide_rolls
+    if rolled_p1 and not rolled_p2:
+        await _finish_21_pvp_game(bot, chat_id, st, winner_id=p1)
+        return
+    if rolled_p2 and not rolled_p1:
+        await _finish_21_pvp_game(bot, chat_id, st, winner_id=p2)
+        return
+    # Если оба не бросили — отменяем матч и возвращаем обе ставки.
+    from db.queries import update_external_user_balance
+    bet = float(st.get("bet_amount") or 0.0)
+    update_external_user_balance(p1, bet)
+    update_external_user_balance(p2, bet)
+    await bot.send_message(chat_id=chat_id, text=t("game21_cancelled", st.get("lang") or DEFAULT_LANG))
+    # Снимаем закреп с объявления поиска
+    pinned_id = st.get("pinned_message_id")
+    if pinned_id is not None:
+        try:
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=int(pinned_id))
+        except Exception:
+            pass
+    _pvp_live_games.pop(chat_id, None)
 
 
 async def _pvp_search_timeout(bot: Bot, owner_user_id: int, token: int):
@@ -768,13 +901,18 @@ async def _pvp_search_timeout(bot: Bot, owner_user_id: int, token: int):
     amount = float(req.get("bet_amount") or 0.0)
     from db.queries import update_external_user_balance
     update_external_user_balance(owner_user_id, amount)
-    # Снимаем закреп, если он был
-    try:
-        message_id = req.get("message_id")
-        if message_id is not None:
-            await bot.unpin_chat_message(chat_id=int(req.get("chat_id") or CHAT_ID), message_id=int(message_id))
-    except Exception:
-        pass
+    # Снимаем закреп и удаляем объявление о поиске соперника из чата
+    chat_id_req = int(req.get("chat_id") or CHAT_ID)
+    message_id = req.get("message_id")
+    if message_id is not None:
+        try:
+            await bot.unpin_chat_message(chat_id=chat_id_req, message_id=int(message_id))
+        except Exception:
+            pass
+        try:
+            await bot.delete_message(chat_id=chat_id_req, message_id=int(message_id))
+        except Exception:
+            pass
     lang = req.get("lang") or DEFAULT_LANG
     try:
         await bot.send_message(
@@ -939,6 +1077,7 @@ async def _handle_pvp_dice(msg: Message) -> bool:
                 st["decide_rolls"] = {}
                 _pvp_live_games[chat_id] = st
                 await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_decide_tie", lang))
+                _arm_pvp_decide_timeout(msg.bot, chat_id, st)
                 return True
             starter = p1 if v1 < v2 else p2
             st["phase"] = "turn"
@@ -1026,9 +1165,17 @@ async def _handle_pvp_dice(msg: Message) -> bool:
         return True
     if total < 16:
         await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_player_result", lang).format(name=name_link, total=total))
-        st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+        st["turn_timeout_token"] = time.time_ns()
         _pvp_live_games[chat_id] = st
-        asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+        asyncio.create_task(
+            _pvp_turn_timeout(
+                msg.bot,
+                chat_id,
+                uid,
+                st["turn_timeout_token"],
+                int(st.get("pvp_session_token") or 0),
+            )
+        )
         return True
     if is_second_player_turn:
         # Второй игрок бросает автоматически, пока не станет:
@@ -1047,18 +1194,34 @@ async def _handle_pvp_dice(msg: Message) -> bool:
                 text=t("game21_pvp_player_can_stop", lang).format(name=name_link, total=total),
                 reply_markup=play21_pvp_stop_keyboard(lang, int(st.get("owner_id") or 0)),
             )
-            st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+            st["turn_timeout_token"] = time.time_ns()
             st["stop_button_message_id"] = stop_msg.message_id
             st["stop_button_uid"] = uid
             _pvp_live_games[chat_id] = st
-            asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+            asyncio.create_task(
+                _pvp_turn_timeout(
+                    msg.bot,
+                    chat_id,
+                    uid,
+                    st["turn_timeout_token"],
+                    int(st.get("pvp_session_token") or 0),
+                )
+            )
             return True
 
         # total < other_total
         await msg.bot.send_message(chat_id=chat_id, text=t("game21_pvp_player_result", lang).format(name=name_link, total=total))
-        st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+        st["turn_timeout_token"] = time.time_ns()
         _pvp_live_games[chat_id] = st
-        asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+        asyncio.create_task(
+            _pvp_turn_timeout(
+                msg.bot,
+                chat_id,
+                uid,
+                st["turn_timeout_token"],
+                int(st.get("pvp_session_token") or 0),
+            )
+        )
         return True
     stop_msg = await msg.bot.send_message(
         chat_id=chat_id,
@@ -1069,9 +1232,17 @@ async def _handle_pvp_dice(msg: Message) -> bool:
     # если пользователь кнопку не нажал.
     st["stop_button_message_id"] = stop_msg.message_id
     st["stop_button_uid"] = uid
-    st["turn_timeout_token"] = int(st.get("turn_timeout_token") or 0) + 1
+    st["turn_timeout_token"] = time.time_ns()
     _pvp_live_games[chat_id] = st
-    asyncio.create_task(_pvp_turn_timeout(msg.bot, chat_id, uid, st["turn_timeout_token"]))
+    asyncio.create_task(
+        _pvp_turn_timeout(
+            msg.bot,
+            chat_id,
+            uid,
+            st["turn_timeout_token"],
+            int(st.get("pvp_session_token") or 0),
+        )
+    )
     return True
 
 
@@ -1176,6 +1347,18 @@ async def _start_21_bot_turn(bot: Bot, user_id: int, lang: str):
             break
     st = _user_state.get(user_id) or {}
     await _finish_21_game(bot, user_id, lang, st)
+
+
+async def _clear_21_bot_stop_keyboard(bot: Bot, user_id: int, state: dict) -> None:
+    """Снять кнопку «Хватит» с предыдущего сообщения бота (режим 21 против бота)."""
+    mid = state.get("stop_button_message_id")
+    if mid is None:
+        return
+    try:
+        await bot.edit_message_reply_markup(chat_id=user_id, message_id=int(mid), reply_markup=None)
+    except Exception:
+        pass
+    state["stop_button_message_id"] = None
 
 
 def _arm_21_player_timeout(bot: Bot, user_id: int):
@@ -1399,9 +1582,9 @@ async def on_menu(cb: CallbackQuery):
             chat_title = str(CHAT_ID)
         parts = []
         if bot_enabled:
-            parts.append(t("game21_rules_bot", lang))
+            parts.append(_game21_rules_bot_display(lang))
         if users_enabled:
-            parts.append(t("game21_rules_users", lang).format(chat_title=chat_title))
+            parts.append(_game21_rules_users_display(lang, chat_title))
         if not parts:
             text = t("game21_rules", lang)
         else:
@@ -1438,20 +1621,10 @@ async def on_menu(cb: CallbackQuery):
         if active_live or active_search:
             await cb.answer(t("game21_pvp_active_exists", lang), show_alert=True)
             return
-        # Запрет PvP, если в чате уже идёт основная игра (games.status == 'active')
-        try:
-            from db.init_db import get_connection
-
-            with get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id FROM games WHERE status = 'active' AND chat_id = %s LIMIT 1", (CHAT_ID,))
-                    row = cur.fetchone()
-                    if row:
-                        await cb.answer(t("game21_pvp_main_active_exists", lang), show_alert=True)
-                        return
-        except Exception:
-            # Если по какой-то причине проверка не удалась — не блокируем PvP.
-            pass
+        # Запрет PvP, если основная игра уже active или уже отправлено напоминание за 5 минут.
+        if _is_main_game_blocking_pvp(CHAT_ID):
+            await cb.answer(t("game21_pvp_main_active_exists", lang), show_alert=True)
+            return
         # Разрешаем PvP только участникам чата
         try:
             chat = await cb.bot.get_chat(CHAT_ID)
@@ -1482,36 +1655,54 @@ async def on_menu(cb: CallbackQuery):
         if st.get("state") != "play21_pvp_wait_confirm":
             await cb.answer()
             return
+        lock = _get_pvp_chat_lock(CHAT_ID)
+        async with lock:
+            # Повторная атомарная проверка: в чате не должно быть другого поиска/матча.
+            active_live = bool(_pvp_live_games.get(CHAT_ID))
+            active_search = any((req or {}).get("chat_id") == CHAT_ID for req in _pvp_search_state.values())
+            if active_live or active_search or _is_main_game_blocking_pvp(CHAT_ID):
+                await cb.answer(t("game21_pvp_main_active_exists", lang), show_alert=True)
+                return
         amount = float(st.get("bet_amount") or 0)
         commission = float(st.get("commission_percent") or 0.0)
         from db.queries import get_external_user_balance, update_external_user_balance
-        bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
-        try:
-            balance_val = float(bal) if bal is not None else 0.0
-        except Exception:
-            balance_val = 0.0
-        if balance_val < amount:
-            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
-            return
-        ok = update_external_user_balance(cb.from_user.id, -amount)
-        if not ok:
-            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
-            return
+        async with lock:
+            bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
+            try:
+                balance_val = float(bal) if bal is not None else 0.0
+            except Exception:
+                balance_val = 0.0
+            if balance_val < amount:
+                await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+                return
+            ok = update_external_user_balance(cb.from_user.id, -amount)
+            if not ok:
+                await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+                return
         amount_str = _format_money(amount)
         possible_win = float(st.get("possible_win") or round((amount * 2) * (1 - commission / 100.0), 2))
         win_str = _format_money(possible_win)
         timeout_token = int(time.time() * 1000)
         display_name = (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id)
         user_link = f'<a href="tg://user?id={cb.from_user.id}">{html.escape(display_name)}</a>'
-        _pvp_search_state[cb.from_user.id] = {
-            "owner_user_id": cb.from_user.id,
-            "bet_amount": amount,
-            "chat_id": CHAT_ID,
-            "created_at": time.time(),
-            "search_timeout_token": timeout_token,
-            "lang": lang,
-            "owner_name": (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id),
-        }
+        async with lock:
+            # Еще одна защита от гонки между списанием и публикацией заявки.
+            if bool(_pvp_live_games.get(CHAT_ID)) or any((req or {}).get("chat_id") == CHAT_ID for req in _pvp_search_state.values()):
+                try:
+                    update_external_user_balance(cb.from_user.id, amount)
+                except Exception:
+                    pass
+                await cb.answer(t("game21_pvp_active_exists", lang), show_alert=True)
+                return
+            _pvp_search_state[cb.from_user.id] = {
+                "owner_user_id": cb.from_user.id,
+                "bet_amount": amount,
+                "chat_id": CHAT_ID,
+                "created_at": time.time(),
+                "search_timeout_token": timeout_token,
+                "lang": lang,
+                "owner_name": (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id),
+            }
         posted_msg = None
         try:
             posted_msg = await cb.bot.send_message(
@@ -1522,7 +1713,9 @@ async def on_menu(cb: CallbackQuery):
         except Exception:
             posted_msg = None
         if posted_msg:
-            _pvp_search_state[cb.from_user.id]["message_id"] = posted_msg.message_id
+            async with lock:
+                if cb.from_user.id in _pvp_search_state:
+                    _pvp_search_state[cb.from_user.id]["message_id"] = posted_msg.message_id
             try:
                 await cb.bot.pin_chat_message(chat_id=CHAT_ID, message_id=posted_msg.message_id)
             except Exception:
@@ -1569,30 +1762,41 @@ async def on_menu(cb: CallbackQuery):
         if not req:
             await cb.answer(t("game21_cancelled", lang), show_alert=True)
             return
-        if req.get("accepted_by"):
-            await cb.answer(t("game21_cancelled", lang), show_alert=True)
-            return
-        amount = float(req.get("bet_amount") or 0.0)
+        game_chat_id = int(req.get("chat_id") or CHAT_ID)
+        lock = _get_pvp_chat_lock(game_chat_id)
         from db.queries import get_external_user_balance, update_external_user_balance, get_21_users_commission_percent
-        bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
-        try:
-            balance_val = float(bal) if bal is not None else 0.0
-        except Exception:
-            balance_val = 0.0
-        if balance_val < amount:
-            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
-            return
-        ok = update_external_user_balance(cb.from_user.id, -amount)
-        if not ok:
-            await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
-            return
-        req["accepted_by"] = cb.from_user.id
-        _pvp_search_state[owner_id] = req
+        async with lock:
+            req = _pvp_search_state.get(owner_id) or {}
+            if not req:
+                await cb.answer(t("game21_cancelled", lang), show_alert=True)
+                return
+            if req.get("accepted_by"):
+                await cb.answer(t("game21_cancelled", lang), show_alert=True)
+                return
+            if bool(_pvp_live_games.get(game_chat_id)) or _is_main_game_blocking_pvp(game_chat_id):
+                await cb.answer(t("game21_pvp_main_active_exists", lang), show_alert=True)
+                return
+            amount = float(req.get("bet_amount") or 0.0)
+            bal = get_external_user_balance(cb.from_user.id, username=cb.from_user.username)
+            try:
+                balance_val = float(bal) if bal is not None else 0.0
+            except Exception:
+                balance_val = 0.0
+            if balance_val < amount:
+                await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+                return
+            ok = update_external_user_balance(cb.from_user.id, -amount)
+            if not ok:
+                await cb.answer(t("game21_not_enough_balance", lang), show_alert=True)
+                return
+            req["accepted_by"] = cb.from_user.id
+            _pvp_search_state[owner_id] = req
         try:
             await cb.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
         amount_str = _format_money(amount)
+        game_lang = req.get("lang") or DEFAULT_LANG
         # Личное сообщение второму игроку о списании ставки
         try:
             await cb.bot.send_message(
@@ -1605,28 +1809,35 @@ async def on_menu(cb: CallbackQuery):
         second_name = (cb.from_user.full_name or "").strip() or (cb.from_user.username or "").strip() or str(cb.from_user.id)
         owner_link = _name_link(owner_id, owner_name)
         second_link = _name_link(cb.from_user.id, second_name)
-        game_lang = req.get("lang") or DEFAULT_LANG
         commission = float(get_21_users_commission_percent() or 0.0)
-        game_chat_id = int(req.get("chat_id") or CHAT_ID)
-        _pvp_live_games[game_chat_id] = {
-            "owner_id": owner_id,
-            "player1_id": owner_id,
-            "player2_id": cb.from_user.id,
-            "chat_id": game_chat_id,
-            "bet_amount": amount,
-            "commission_percent": commission,
-            "phase": "decide_first",
-            "decide_rolls": {},
-            "lang": game_lang,
-            "names": {
-                owner_id: owner_name,
-                cb.from_user.id: second_name,
-            },
-            "pinned_message_id": req.get("message_id"),
-            "throw_order_seq": 0,
-            "round_events": [],
-        }
-        _pvp_search_state.pop(owner_id, None)
+        async with lock:
+            if bool(_pvp_live_games.get(game_chat_id)):
+                try:
+                    update_external_user_balance(cb.from_user.id, amount)
+                except Exception:
+                    pass
+                await cb.answer(t("game21_pvp_active_exists", lang), show_alert=True)
+                return
+            _pvp_live_games[game_chat_id] = {
+                "owner_id": owner_id,
+                "player1_id": owner_id,
+                "player2_id": cb.from_user.id,
+                "chat_id": game_chat_id,
+                "bet_amount": amount,
+                "commission_percent": commission,
+                "phase": "decide_first",
+                "decide_rolls": {},
+                "lang": game_lang,
+                "names": {
+                    owner_id: owner_name,
+                    cb.from_user.id: second_name,
+                },
+                "pinned_message_id": req.get("message_id"),
+                "throw_order_seq": 0,
+                "round_events": [],
+                "pvp_session_token": time.time_ns(),
+            }
+            _pvp_search_state.pop(owner_id, None)
         await cb.bot.send_message(
             chat_id=game_chat_id,
             text=t("game21_pvp_started", game_lang).format(p1=owner_link, p2=second_link, amount=amount_str),
@@ -1638,9 +1849,14 @@ async def on_menu(cb: CallbackQuery):
             chat_title = str(game_chat_id)
         await cb.bot.send_message(
             chat_id=game_chat_id,
-            text=t("game21_rules_users", game_lang).format(chat_title=chat_title),
+            text=_game21_rules_users_display(game_lang, chat_title),
         )
-        await cb.bot.send_message(chat_id=game_chat_id, text=t("game21_pvp_decide_first", game_lang))
+        players_links = f"{owner_link}, {second_link}"
+        await cb.bot.send_message(
+            chat_id=game_chat_id,
+            text=t("game21_pvp_decide_first", game_lang).format(players=players_links),
+        )
+        _arm_pvp_decide_timeout(cb.bot, game_chat_id, _pvp_live_games.get(game_chat_id) or {})
         await cb.answer()
     elif action.startswith("play21bot:pvp:stop:"):
         parts = action.split(":")
@@ -1728,7 +1944,10 @@ async def on_menu(cb: CallbackQuery):
             "bot_throws": [],
             "session_id": session_id,
         }
-        await _send_fresh_callback(cb, t("game21_rules", lang))
+        await _send_fresh_callback(
+            cb,
+            t("game21_rules_title", lang) + "\n\n" + _game21_rules_bot_display(lang),
+        )
         await cb.bot.send_message(chat_id=cb.from_user.id, text=t("game21_throw_now", lang))
         _arm_21_player_timeout(cb.bot, cb.from_user.id)
         await cb.answer()
@@ -1749,6 +1968,11 @@ async def on_menu(cb: CallbackQuery):
         if total < 16:
             await cb.answer()
             return
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        st.pop("stop_button_message_id", None)
         st["state"] = "play21_player_turn_done"
         _user_state[cb.from_user.id] = st
         await cb.answer()
@@ -1919,6 +2143,20 @@ async def on_admin(cb: CallbackQuery):
         _admin_state[cb.from_user.id] = {"state": "admin_21_fee_input_bot"}
         await cb.message.edit_text(
             f"{t('admin_21_fee_enter', lang)}\n{t('admin_cancel_hint', lang)}",
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:rules:bot":
+        _admin_state[cb.from_user.id] = {"state": "admin_21_rules_input_bot"}
+        await cb.message.edit_text(
+            f"{t('admin_21_rules_enter_bot', lang)}\n{t('admin_cancel_hint', lang)}",
+        )
+        await cb.answer()
+        return
+    if data == "admin:settings21:rules:users":
+        _admin_state[cb.from_user.id] = {"state": "admin_21_rules_input_users"}
+        await cb.message.edit_text(
+            f"{t('admin_21_rules_enter_users', lang)}\n{t('admin_cancel_hint', lang)}",
         )
         await cb.answer()
         return
@@ -2284,6 +2522,17 @@ async def on_admin(cb: CallbackQuery):
         if game_id:
             for place, raw_text in enumerate(prizes_coupons, 1):
                 add_prize(game_id, place, raw_text)
+            # Публикуем анонс о создании игры в чате
+            try:
+                game_type_label = _game_type_label(lang, game_type)
+                announce_text = (
+                    f"Игра {game_type_label} создана.\n"
+                    f"Дата: {start_time.strftime('%d.%m.%Y %H:%M')}\n"
+                    "Запись на игру через бота @gameprize2026_bot"
+                )
+                await cb.bot.send_message(chat_id=chat_id, text=announce_text)
+            except Exception:
+                pass
         _admin_clear(cb.from_user.id)
         await cb.message.edit_text(t("admin_game_created", lang), reply_markup=admin_create_game_type_keyboard(lang))
         await cb.answer()
@@ -2983,6 +3232,39 @@ async def on_user_private_message(msg: Message):
             _admin_clear(user_id)
             await msg.answer(t("admin_add_chat_ok", lang).format(chat_id=val), reply_markup=admin_main_keyboard(lang))
             return
+        if admin_state.get("state") in ("admin_21_rules_input_bot", "admin_21_rules_input_users"):
+            lang = _user_lang(msg)
+            is_bot = admin_state.get("state") == "admin_21_rules_input_bot"
+            if (msg.text or "").strip() == "/back":
+                _admin_clear(user_id)
+                back_kb = admin_settings_21_bot_keyboard(lang) if is_bot else admin_settings_21_users_keyboard(lang)
+                await msg.answer(
+                    t("admin_21_btn_vs_bot_menu", lang) if is_bot else t("admin_21_btn_vs_players_menu", lang),
+                    reply_markup=back_kb,
+                )
+                return
+            raw = (msg.text or "").strip()
+            if raw in ("-", "/clear"):
+                val_rules = None
+            else:
+                if len(raw) > 4000:
+                    await msg.answer(t("admin_21_rules_too_long", lang))
+                    return
+                val_rules = raw
+            from db.queries import set_21_rules_bot_text, set_21_rules_users_text
+
+            if is_bot:
+                ok = set_21_rules_bot_text(val_rules)
+                back_kb = admin_settings_21_bot_keyboard(lang)
+            else:
+                ok = set_21_rules_users_text(val_rules)
+                back_kb = admin_settings_21_users_keyboard(lang)
+            if not ok:
+                await msg.answer(t("admin_21_rules_save_failed", lang))
+                return
+            _admin_clear(user_id)
+            await msg.answer(t("admin_21_rules_saved", lang), reply_markup=back_kb)
+            return
         if admin_state.get("state") in ("admin_21_fee_input_bot", "admin_21_fee_input_users"):
             lang = _user_lang(msg)
             if (msg.text or "").strip() == "/back":
@@ -3080,6 +3362,8 @@ async def on_user_private_dice(msg: Message):
     if not msg.dice or getattr(msg.dice, "emoji", None) != "🎲":
         return
     lang = _user_lang(msg)
+    # Если пользователь бросает снова вместо «Хватит» — убираем клавиатуру с прошлого сообщения.
+    await _clear_21_bot_stop_keyboard(msg.bot, user_id, state)
     state["player_total"] = int(state.get("player_total") or 0) + int(msg.dice.value or 0)
     throws = list(state.get("player_throws") or [])
     throws.append(int(msg.dice.value or 0))
@@ -3098,12 +3382,15 @@ async def on_user_private_dice(msg: Message):
         return
     if total < 16:
         await msg.answer(t("game21_player_result", lang).format(total=total))
+        _user_state[user_id] = state
         _arm_21_player_timeout(msg.bot, user_id)
         return
-    await msg.answer(
+    sent = await msg.answer(
         t("game21_player_can_stop", lang).format(total=total),
         reply_markup=play21_stop_keyboard(lang),
     )
+    state["stop_button_message_id"] = sent.message_id
+    _user_state[user_id] = state
     _arm_21_player_timeout(msg.bot, user_id)
 
 

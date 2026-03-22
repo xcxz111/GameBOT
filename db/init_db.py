@@ -280,6 +280,27 @@ def _migrate_21_commission_users_percent(cur):
     cur.execute("ALTER TABLE game21_bot_settings ADD COLUMN commission_users_percent DECIMAL(5,2) NOT NULL DEFAULT 0.00 AFTER commission_percent")
 
 
+def _migrate_21_rules_text(cur):
+    """Тексты правил 21 (против бота / между пользователями), задаются в админке."""
+    for col, alter in (
+        (
+            "rules_bot_text",
+            "ALTER TABLE game21_bot_settings ADD COLUMN rules_bot_text MEDIUMTEXT NULL AFTER commission_users_percent",
+        ),
+        (
+            "rules_users_text",
+            "ALTER TABLE game21_bot_settings ADD COLUMN rules_users_text MEDIUMTEXT NULL AFTER rules_bot_text",
+        ),
+    ):
+        cur.execute(
+            """SELECT COLUMN_NAME FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'game21_bot_settings' AND COLUMN_NAME = %s""",
+            (MYSQL_DATABASE, col),
+        )
+        if not cur.fetchone():
+            cur.execute(alter)
+
+
 def _migrate_21_enabled_users(cur):
     """Добавить флаг enabled_users для режима 21 против пользователей."""
     cur.execute("""
@@ -346,6 +367,10 @@ def create_tables():
                 pass
             try:
                 _migrate_21_enabled_users(cur)
+            except Exception:
+                pass
+            try:
+                _migrate_21_rules_text(cur)
             except Exception:
                 pass
             try:
